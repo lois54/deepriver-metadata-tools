@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-24 12:50 PM EDT
+# Generated: 2026-07-24 03:09 PM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -110,7 +110,6 @@ import re
 import io
 import sys
 import csv
-import shutil
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -141,90 +140,71 @@ PERSONS_STATIC_SUFFIX = (
     "Webb, Robert; Charter Oak Scanning and Digitization|relators:ctb"
 )
 
-# notes field - fixed credits block for every issue.
-# --- NOTES BLOCK START --- (do not edit this marker line - the
-# --edit-notes startup flag uses it to find and replace this block)
-NOTES = (
-    "creation/production credits|Deep River Public Library -- Patrick McGlamery^^"
-    "creation/production credits|Chester Historical Society -- Adrian Nicholls^^"
-    "creation/production credits|Westbrook Historical Society -- Sandy Forest^^"
-    "creation/production credits|Deep River Historical Society--Simon LaPlace^^"
-    "creation/production credits|Deep River Public Library--AC Proctor^^"
-    "creation/production credits|Deep River Public Library--Lois Blood Bennett"
-)
-# --- NOTES BLOCK END ---
+# notes field (column AB) - fixed credits block for every issue, loaded
+# from NOTES_CONFIG_FILENAME (a plain text file next to this script) so
+# it can be updated by editing that file directly - no code changes
+# needed. See load_notes() below for the file format and location.
+NOTES_CONFIG_FILENAME = "notes_config.txt"
+
+_notes_cache = None  # filled in by load_notes() the first time it's called
 
 
-def edit_notes_interactively():
-    """
-    Lets you update the NOTES constant WITHOUT hand-editing Python code.
-    Walks you through entering credit lines one at a time, makes a
-    timestamped backup of this whole script first, then rewrites the
-    NOTES block (between the START/END markers above) in place.
-
-    Triggered by running:  python build_issue_csv.py --edit-notes
-    """
-    script_path = os.path.abspath(__file__)
-
-    print("=== Edit the notes credits list ===")
-    print("Valid note_type for these is always 'creation/production credits'.")
-    print("Enter each credit as it should appear (e.g. 'Deep River Public")
-    print("Library -- Patrick McGlamery'). Leave blank and press Enter when done.")
-    print()
-
-    new_entries = []
-    i = 1
-    while True:
-        entry = input(f"  Credit #{i} (blank to finish): ").strip()
-        if not entry:
-            break
-        new_entries.append(entry)
-        i += 1
-
-    if not new_entries:
-        print("No credits entered - leaving the existing NOTES unchanged.")
-        return
-
-    print()
-    print("New list will be:")
-    for entry in new_entries:
-        print(f"  - {entry}")
-    confirm = input("Save this? (y/n): ").strip().lower()
-    if confirm != "y":
-        print("Cancelled - no changes made.")
-        return
-
-    # ---- Back up the script before touching it ------------------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = f"{script_path}.bak_{timestamp}"
-    shutil.copy2(script_path, backup_path)
-    print(f"Backed up current script to: {backup_path}")
-
-    # ---- Build the replacement NOTES block text ------------------------
-    quoted_lines = []
-    for i, entry in enumerate(new_entries):
-        suffix = "^^" if i < len(new_entries) - 1 else ""
-        quoted_lines.append(f'"creation/production credits|{entry}{suffix}"')
-    new_block = "NOTES = (\n    " + "\n    ".join(quoted_lines) + "\n)"
-
-    # ---- Read the script, replace ONLY the text between the markers ----
-    with open(script_path, "r", encoding="utf-8") as f:
-        source = f.read()
-
-    start_marker = "# --- NOTES BLOCK START ---"
-    end_marker = "# --- NOTES BLOCK END ---"
-    start_index = source.index(start_marker) + len(start_marker)
-    end_index = source.index(end_marker)
-
-    updated_source = (
-        source[:start_index] + "\n" + new_block + "\n" + source[end_index:]
+def get_notes_config_path():
+    """The notes config file always lives in the SAME FOLDER as this
+    script itself (not wherever the data files happen to be), so it
+    stays with the code rather than getting mixed in with Google Drive
+    data folders."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), NOTES_CONFIG_FILENAME
     )
 
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(updated_source)
 
-    print("Done! The script's NOTES constant has been updated.")
-    print(f"(If anything looks wrong, restore from: {backup_path})")
+def load_notes():
+    """
+    Read the notes config file and build the notes field's value from
+    it. The file format is simple - one credit per line:
+
+        note_type: note text
+
+    e.g.:
+        creation/production credits: Deep River Public Library -- Patrick McGlamery
+        creation/production credits: Chester Historical Society -- Adrian Nicholls
+
+    Blank lines and lines starting with "#" are ignored, so the file can
+    have comments/spacing for readability. The result is cached after
+    the first read, so the file is only read once per run even though
+    every issue needs this value.
+    """
+    global _notes_cache
+    if _notes_cache is not None:
+        return _notes_cache
+
+    config_path = get_notes_config_path()
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"Notes config file not found: {config_path}\n"
+            f"Create it with one 'note_type: note text' entry per line, e.g.:\n"
+            f"  creation/production credits: Deep River Public Library -- Patrick McGlamery"
+        )
+
+    entries = []
+    with open(config_path, "r", encoding="utf-8") as f:
+        for line_number, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                print(f"WARNING: {config_path} line {line_number} has no "
+                      f"':' separator, skipping: {line}")
+                continue
+            note_type, _, note = line.partition(":")
+            entries.append(f"{note_type.strip()}|{note.strip()}")
+
+    if not entries:
+        raise ValueError(f"Notes config file has no valid entries: {config_path}")
+
+    _notes_cache = MULTI_SEP.join(entries)
+    return _notes_cache
 
 # origin_information - the parts of this field that are the SAME on every
 # issue. date_created (from the TIFF filename) and date_captured (today's
@@ -342,6 +322,13 @@ MULTI_SEP = "^^"
 # together in one file).
 TARGET_LINES_PER_FILE = 800
 
+# When issues are more than this many years apart, force a new output
+# file rather than lumping a big historical gap into one file (e.g. an
+# 1876 issue immediately followed by an 1885 issue, with nothing in
+# between). A gap of 1 is normal (a volume straddling New Year's), so
+# this only kicks in for genuinely non-contiguous data.
+MAX_CONTIGUOUS_YEAR_GAP = 1
+
 # All 64 column names, in the exact order the repository ingest expects.
 COLUMNS = [
     "ID", "member_of", "member_of_existing_entity_id", "publish",
@@ -404,21 +391,26 @@ GOOGLE_SHEETS_URL_PATTERN = re.compile(
 # more than one tab, this is how we know which one to read.
 GOOGLE_SHEETS_GID_PATTERN = re.compile(r'[#&?]gid=(\d+)')
 
-# The two input files for one volume. Rather than requiring a specific
-# prefix grammar, these just look for the "tifflist" / "Town List"
-# keyword at the end of the filename (allowing .txt or .csv for the
-# tifflist, .xlsx or .csv for the Town List) and capture WHATEVER comes
-# before it as the volume label - e.g. "Vol_09_tifflist.txt",
-# "vI_tifflist.txt", "09_tifflist.txt", "Vol-1-Town-List.xlsx" all work.
-# extract_volume_token() + normalize_volume() below turn that captured
-# text into a comparable volume identity, so differently-styled labels
-# for the SAME volume (like "vI" and "Vol_1") still pair up correctly.
+# The two kinds of input files. Rather than requiring a specific prefix
+# grammar, these just look for the "tifflist" / "town list" keyword
+# ANYWHERE in the filename (allowing .txt or .csv for the tifflist,
+# .xlsx or .csv for the Town List) - e.g. "Vol_09_tifflist.txt",
+# "vI_tifflist.txt", "09_tifflist.txt", "Vol-1-Town-List.xlsx", and
+# "Town_List_1885_Old_Method_-_1885.csv" (keyword NOT at the end) all
+# get recognized. extract_volume_token() + normalize_volume() below turn
+# whatever text surrounds the keyword into a comparable volume identity.
 TIFFLIST_FILENAME_PATTERN = re.compile(
     r'^(.*?)_?(?i:tifflist)\.(?i:txt|csv)$'
 )
-TOWNLIST_FILENAME_PATTERN = re.compile(
-    r'^(.*?)_?(?i:town[_ -]?list)\.(?i:xlsx|csv)$'
-)
+TOWNLIST_KEYWORD_PATTERN = re.compile(r'(?i:town[_ -]?list)')
+
+
+def is_town_list_filename(filename):
+    """True for any .xlsx/.csv file with the 'town list' keyword
+    anywhere in its name (see TOWNLIST_KEYWORD_PATTERN)."""
+    if not filename.lower().endswith((".xlsx", ".csv")):
+        return False
+    return bool(TOWNLIST_KEYWORD_PATTERN.search(filename))
 
 # An existing merged ingest output file, e.g. "1885-1886-ingest.csv" -
 # the two years are the earliest and latest issue dates actually
@@ -610,14 +602,31 @@ def parse_town_list(grid):
 
 def parse_format_a_rows(grid):
     """
-    Parse "old method" layout:
+    Parse "one row per issue" layout:
 
-        filename  | No. | Subject 1  | Subject 2 | ...
-        18850...  | 39  | Deep River | Chester   | ...
+        No. | Subject 1  | Subject 2 | ...
+        39  | Deep River | Chester   | ...
 
-    One issue per ROW. We find whichever column is the paper-number column
-    (its header is something like "No." or "Paper No."), and every column
-    after that is treated as a town name (blank cells are just skipped).
+    or the "Old Method" variant, which adds a reference-filename column
+    BEFORE the paper number:
+
+        Filelist.txt              | No. | Subject 1  | ...
+        18850102_vXI_n39.pdf      | 39  | Deep River | ...
+
+    We find whichever column is the paper-number column (its header is
+    something like "No." or "Paper No."), and every column after that is
+    treated as a town name (blank cells are just skipped).
+
+    If there's ALSO a column before it whose header looks like a
+    filename reference (contains "file"), each row's volume is read
+    from that filename via parse_issue_prefix() - this matters because
+    paper numbers reset every volume, so a Town List spanning more than
+    one volume (like the "Old Method" example above, which covers both
+    Vol. XI and Vol. XII) needs a per-row volume to avoid collisions.
+    Otherwise every row's volume is left as None, to be resolved later
+    from context (see resolve_town_list_volumes()).
+
+    Returns dict[(volume_or_None, paper_no)] -> list of town names.
     """
     header_row = grid[0]
 
@@ -636,7 +645,13 @@ def parse_format_a_rows(grid):
             "like 'No.' or 'Paper No.') in this Town List file."
         )
 
-    town_list_by_paper_no = {}
+    reference_col = None
+    for col_index in range(paper_no_col):
+        if "file" in header_row[col_index].strip().lower():
+            reference_col = col_index
+            break
+
+    town_list = {}
 
     # Walk every data row (skip the header row itself).
     for row in grid[1:]:
@@ -649,6 +664,12 @@ def parse_format_a_rows(grid):
 
         paper_no = int(paper_no_text)
 
+        volume = None
+        if reference_col is not None and reference_col < len(row):
+            parsed = parse_issue_prefix(row[reference_col])
+            if parsed:
+                volume, _ = parsed
+
         # Every column AFTER the paper-number column is a potential town.
         # Blank cells are simply skipped (that's how the padding works).
         towns = [
@@ -657,9 +678,9 @@ def parse_format_a_rows(grid):
             if cell.strip()
         ]
 
-        town_list_by_paper_no[paper_no] = towns
+        town_list[(volume, paper_no)] = towns
 
-    return town_list_by_paper_no
+    return town_list
 
 
 def parse_format_b_transposed(grid):
@@ -674,9 +695,14 @@ def parse_format_b_transposed(grid):
     (starting at column 1; column 0 is just the "Paper No." label).
     Every row after that holds one more town for each column, reading
     top-to-bottom until the cells run out (blank = no more towns).
+
+    This format has no per-row volume reference, so every entry's
+    volume is left as None (to be resolved later from context - see
+    resolve_town_list_volumes()). Returns dict[(None, paper_no)] ->
+    list of town names.
     """
     header_row = grid[0]
-    town_list_by_paper_no = {}
+    town_list = {}
 
     # Walk every column starting at index 1 (index 0 is the row label).
     for col_index in range(1, len(header_row)):
@@ -695,9 +721,9 @@ def parse_format_b_transposed(grid):
                 if town:
                     towns.append(town)
 
-        town_list_by_paper_no[paper_no] = towns
+        town_list[(None, paper_no)] = towns
 
-    return town_list_by_paper_no
+    return town_list
 
 
 # =============================================================================
@@ -769,6 +795,38 @@ def extract_volume_token(prefix):
     return prefix
 
 
+ISSUE_PREFIX_PATTERN = re.compile(r'^(\d{8})_v([A-Za-z0-9]+)_n(\d+)')
+
+
+def parse_issue_prefix(text):
+    """
+    Pull (volume, paper_no) out of the START of a reference string like
+    "18850102_vXI_n39.pdf" or "18850102_vXI_n39" - used for "Old Method"
+    Town List files, whose first column names the issue by filename
+    (with no page number, and often a .pdf extension) rather than a
+    bare paper number. Returns None if it doesn't look like one of these.
+    """
+    match = ISSUE_PREFIX_PATTERN.match(text.strip())
+    if not match:
+        return None
+    _, volume_raw, paper_no_text = match.groups()
+    return normalize_volume(volume_raw), int(paper_no_text)
+
+
+def volume_from_town_list_filename(filename):
+    """
+    Derive a volume label from a Town List's OWN filename (e.g.
+    "Vol_1_Town_List.xlsx" -> "I"), for the common case where the whole
+    file is just one volume's worth of plain paper numbers with no
+    per-row volume reference. Returns None if no volume label can be
+    found in the filename at all.
+    """
+    name = os.path.splitext(filename)[0]
+    prefix = TOWNLIST_KEYWORD_PATTERN.sub("", name)
+    token = extract_volume_token(prefix)
+    return normalize_volume(token) if token else None
+
+
 def parse_tiff_filename(filename):
     """
     Pull the useful pieces out of one TIFF filename, e.g.
@@ -817,7 +875,7 @@ def scan_tiff_directory(tiff_dir):
     filename, and group the individual PAGE files into ISSUES.
 
     Returns a dictionary that maps:
-        paper number (int) -> {
+        (volume, paper number) -> {
             "issue_id": "18850116_vXI_n41",   # filename with page # removed
             "date":     "1885-01-16",         # ISO-formatted date string
             "volume":   "XI",
@@ -828,10 +886,15 @@ def scan_tiff_directory(tiff_dir):
             ]
         }
 
+    Keying by (volume, paper number) together - rather than just paper
+    number - matters because paper numbering resets every volume, so
+    two different volumes can both have a "paper #1"; keying by paper
+    number alone would silently merge them.
+
     Files that don't match the expected naming pattern are collected
     separately and returned too, so the calling code can report them.
     """
-    issues_by_paper_no = {}
+    issues_by_key = {}
     unrecognized_files = []
 
     for filename in sorted(os.listdir(tiff_dir)):
@@ -846,17 +909,18 @@ def scan_tiff_directory(tiff_dir):
             continue
 
         issue_id, date_iso, volume, paper_no, page_number = parsed
+        key = (volume, paper_no)
 
-        # First time we've seen this paper number? Start a new entry.
-        if paper_no not in issues_by_paper_no:
-            issues_by_paper_no[paper_no] = {
+        # First time we've seen this volume+paper number? Start a new entry.
+        if key not in issues_by_key:
+            issues_by_key[key] = {
                 "issue_id": issue_id,
                 "date": date_iso,
                 "volume": volume,
                 "pages": [],
             }
 
-        issues_by_paper_no[paper_no]["pages"].append({
+        issues_by_key[key]["pages"].append({
             "filename": filename,
             "page_number": page_number,
             # We're scanning a real local folder here, so we don't know
@@ -865,7 +929,7 @@ def scan_tiff_directory(tiff_dir):
             "digital_file": build_digital_file(date_iso, filename),
         })
 
-    return issues_by_paper_no, unrecognized_files
+    return issues_by_key, unrecognized_files
 
 
 def read_tiff_list_file(list_file_path):
@@ -891,9 +955,10 @@ def read_tiff_list_file(list_file_path):
     whatever path text happens to already be in the file.
 
     Returns the exact same shape as scan_tiff_directory(): a dictionary
-    of issues, plus a list of any lines we couldn't make sense of.
+    of issues keyed by (volume, paper number), plus a list of any lines
+    we couldn't make sense of.
     """
-    issues_by_paper_no = {}
+    issues_by_key = {}
     unrecognized_lines = []
 
     # "utf-8-sig" quietly strips a byte-order-mark if the file has one
@@ -921,22 +986,23 @@ def read_tiff_list_file(list_file_path):
                 continue
 
             issue_id, date_iso, volume, paper_no, page_number = parsed
+            key = (volume, paper_no)
 
-            if paper_no not in issues_by_paper_no:
-                issues_by_paper_no[paper_no] = {
+            if key not in issues_by_key:
+                issues_by_key[key] = {
                     "issue_id": issue_id,
                     "date": date_iso,
                     "volume": volume,
                     "pages": [],
                 }
 
-            issues_by_paper_no[paper_no]["pages"].append({
+            issues_by_key[key]["pages"].append({
                 "filename": filename,
                 "page_number": page_number,
                 "digital_file": build_digital_file(date_iso, filename),
             })
 
-    return issues_by_paper_no, unrecognized_lines
+    return issues_by_key, unrecognized_lines
 
 
 # =============================================================================
@@ -977,15 +1043,20 @@ def format_date_long(date_iso):
 # STEP 5 - BUILD THE FULL, 64-COLUMN INGEST ROWS
 # =============================================================================
 
-def compute_issue_record(paper_no, issue, town_lists):
+def compute_issue_record(key, issue, town_lists):
     """
     Gather everything needed to describe ONE issue - title, subject/geo,
     origin_information, etc - WITHOUT assigning any ID numbers yet. This
     is the "content" of an issue, independent of where it ends up in a
     CSV, which is what lets the same issue be safely compared against an
     already-written row later (for by-year merging/dedup).
+
+    key - (volume, paper_no), matching how tiff_issues and town_lists
+          are both keyed (see scan_tiff_directory / read_tiff_list_file
+          and resolve_town_list_volumes)
     """
-    towns = town_lists.get(paper_no, [])
+    volume, paper_no = key
+    towns = town_lists.get(key, [])
     subject_val, geo_val = build_subject_and_geo(towns)
 
     issue_num_padded = f"{paper_no:02d}"
@@ -1036,7 +1107,7 @@ def build_parent_row_dict(record):
         "genre": GENRE,
         "subject": record["subject"],
         "geographic_subject": record["geographic_subject"],
-        "notes": NOTES,
+        "notes": load_notes(),
         "local_identifier": record["issue_id"],
     })
     return row
@@ -1092,6 +1163,13 @@ def chunk_records_by_line_limit(records, start_line_count=1,
     across two chunks, so one unusually large issue can push a chunk
     over the target by itself.
 
+    A chunk boundary is ALSO forced whenever there's a gap of more than
+    MAX_CONTIGUOUS_YEAR_GAP years between one issue and the next (e.g.
+    an 1876 issue followed by an 1885 issue) - even if there's still
+    plenty of room left under target_lines - so that a large historical
+    gap doesn't get lumped into one oddly-named file like
+    "1876-1885-ingest.csv".
+
     start_line_count lets the FIRST chunk account for a header + rows
     that already exist in a file being appended to (pass 1 for a brand
     new, empty file). Every chunk after the first always starts fresh
@@ -1102,16 +1180,22 @@ def chunk_records_by_line_limit(records, start_line_count=1,
     chunks = []
     current_chunk = []
     current_lines = start_line_count
+    current_chunk_end_year = None
 
     for record in records:
         issue_line_count = 1 + len(record["pages"])  # parent row + pages
-        if current_chunk and current_lines + issue_line_count > target_lines:
+        year_gap = (
+            current_chunk_end_year is not None
+            and int(record["year"]) - int(current_chunk_end_year) > MAX_CONTIGUOUS_YEAR_GAP
+        )
+        if current_chunk and (current_lines + issue_line_count > target_lines or year_gap):
             chunks.append(current_chunk)
             current_chunk = []
             current_lines = 1  # a new file, just the header so far
 
         current_chunk.append(record)
         current_lines += issue_line_count
+        current_chunk_end_year = record["year"]
 
     if current_chunk:
         chunks.append(current_chunk)
@@ -1130,41 +1214,142 @@ def chunk_records_by_line_limit(records, start_line_count=1,
 # in a directory (used by --by-year / merge mode below).
 # =============================================================================
 
-def find_volume_pairs(directory):
+def find_tiff_source_files(directory):
+    """Every file in `directory` that looks like a tifflist, by name."""
+    return sorted(
+        f for f in os.listdir(directory) if TIFFLIST_FILENAME_PATTERN.match(f)
+    )
+
+
+def find_town_list_source_files(directory):
+    """Every file in `directory` that looks like a Town List, by name."""
+    return sorted(f for f in os.listdir(directory) if is_town_list_filename(f))
+
+
+def resolve_town_list_volumes(town_lists, tiff_issues, filename_hint=None):
     """
-    Scan `directory` for every tifflist file that has a matching Town
-    List file for the SAME volume - regardless of exactly how each
-    filename labels that volume (e.g. "vI_tifflist.txt" pairs with
-    "Vol_1_Town_List.xlsx", "09_tifflist.txt" pairs with
-    "Vol_09_Town_List.csv", etc). Whatever text precedes the "tifflist"
-    / "Town List" keyword is run through extract_volume_token() then
-    normalize_volume() before matching, so differently-styled labels for
-    the same volume are recognized as identical.
+    town_lists may contain entries keyed (None, paper_no) - meaning "we
+    don't know which volume this row belongs to" (a plain "No." column
+    with no per-row filename reference). This resolves those using
+    whatever context is available:
 
-    Returns a list of (volume, tiff_filename, townlist_filename) tuples,
-    where `volume` is the NORMALIZED roman-numeral form (e.g. "I").
+        1. Try to read a volume label off the Town List's OWN filename
+           (e.g. "Vol_1_Town_List.xlsx" -> "I") - this is the normal,
+           reliable case, since standard-format Town Lists are named
+           per volume by convention.
+        2. If the filename has no discernible volume label at all (e.g.
+           a bare "Town_List.csv"), and every TIFF issue read so far
+           happens to belong to a single volume, assume the Town List's
+           rows belong to that same volume.
+        3. If neither works, those rows can't be matched to anything -
+           they're dropped, and a problem string is returned explaining
+           why.
+
+    Returns (resolved_town_lists, problems) - resolved_town_lists has
+    every key as (volume, paper_no), never (None, paper_no).
     """
-    def volume_key(prefix):
-        token = extract_volume_token(prefix)
-        return normalize_volume(token) if token else ""
+    none_keys = [k for k in town_lists if k[0] is None]
+    if not none_keys:
+        return town_lists, []
 
-    tiff_files = {}
-    townlist_files = {}
+    resolved = {k: v for k, v in town_lists.items() if k[0] is not None}
+    problems = []
 
-    for filename in os.listdir(directory):
-        match = TIFFLIST_FILENAME_PATTERN.match(filename)
-        if match:
-            tiff_files[volume_key(match.group(1))] = filename
-            continue
-        match = TOWNLIST_FILENAME_PATTERN.match(filename)
-        if match:
-            townlist_files[volume_key(match.group(1))] = filename
+    fallback_volume = volume_from_town_list_filename(filename_hint) if filename_hint else None
+    if fallback_volume is None:
+        candidate_volumes = {k[0] for k in tiff_issues}
+        if len(candidate_volumes) == 1:
+            fallback_volume = next(iter(candidate_volumes))
 
-    pairs = []
-    for volume in sorted(tiff_files):
-        if volume in townlist_files:
-            pairs.append((volume, tiff_files[volume], townlist_files[volume]))
-    return pairs
+    if fallback_volume:
+        for (_, paper_no) in none_keys:
+            resolved[(fallback_volume, paper_no)] = town_lists[(None, paper_no)]
+    else:
+        problems.append(
+            f"[unresolved_volume] {len(none_keys)} row(s) use plain paper "
+            f"numbers with no way to tell which volume they belong to "
+            f"(no per-row filename reference, no single matching volume "
+            f"among the TIFF data, and no volume label in this file's own "
+            f"name) - these rows were skipped."
+        )
+
+    return resolved, problems
+
+
+def gather_all_records(directory):
+    """
+    Read EVERY recognized tifflist file and EVERY recognized Town List
+    file in `directory` - regardless of how they're individually named,
+    or whether they line up 1:1 - and combine everything into one pool
+    of issue records, joined by (volume, paper number) rather than by
+    which specific files they happened to come from. This is what lets
+    a single tifflist file spanning multiple volumes (e.g. "tifflist.txt"
+    covering both Vol. XI and Vol. XII) match correctly against a Town
+    List using either the plain "No." format or the "Old Method" format
+    (a per-row filename reference column).
+
+    Returns (records, problems, tiff_filenames, townlist_filenames).
+    """
+    tiff_filenames = find_tiff_source_files(directory)
+    townlist_filenames = find_town_list_source_files(directory)
+
+    all_problems = []
+
+    # ---- Read every tifflist file into one combined pool ---------------
+    all_tiff_issues = {}
+    for filename in tiff_filenames:
+        path = os.path.join(directory, filename)
+        print(f"Reading tifflist: {filename}")
+        issues, unrecognized = read_tiff_list_file(path)
+
+        for key, issue in issues.items():
+            if key in all_tiff_issues:
+                all_problems.append(
+                    f"[{filename}] [duplicate_tiff_entry] Vol_{key[0]} "
+                    f"paper #{key[1]} was already read from another "
+                    f"tifflist file - keeping the first one seen."
+                )
+                continue
+            all_tiff_issues[key] = issue
+
+        for item in unrecognized:
+            all_problems.append(
+                f"[{filename}] [unrecognized_filename] '{item}' does not "
+                f"match the expected pattern and was skipped."
+            )
+
+    # ---- Read every Town List file into one combined pool ---------------
+    all_town_lists = {}
+    for filename in townlist_filenames:
+        path = os.path.join(directory, filename)
+        print(f"Reading Town List: {filename}")
+        grid = read_grid(path)
+        raw_town_list = parse_town_list(grid)
+        resolved, resolve_problems = resolve_town_list_volumes(
+            raw_town_list, all_tiff_issues, filename_hint=filename
+        )
+        all_problems.extend(f"[{filename}] {p}" for p in resolve_problems)
+
+        for key, towns in resolved.items():
+            if key in all_town_lists:
+                all_problems.append(
+                    f"[{filename}] [duplicate_town_list_entry] "
+                    f"Vol_{key[0]} paper #{key[1]} was already read from "
+                    f"another Town List file - keeping the first one seen."
+                )
+                continue
+            all_town_lists[key] = towns
+
+    source_label = (
+        f"{len(tiff_filenames)} tifflist file(s)" if tiff_filenames
+        else "no tifflist files found"
+    )
+    records, join_problems = records_from_single_source(
+        all_tiff_issues, all_town_lists, [], source_label=source_label,
+    )
+    all_problems.extend(join_problems)
+
+    return records, all_problems, tiff_filenames, townlist_filenames
 
 
 # =============================================================================
@@ -1260,7 +1445,12 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     Turn one already-read (tiff_issues, town_lists) pair into a list of
     issue records plus a list of human-readable problem descriptions
     (missing_tiffs / missing_town_list / unrecognized_filename) - shared
-    by both the directory-scanning mode and the manual single-pair mode.
+    by both the default directory-gathering mode and manual single-pair
+    mode.
+
+    tiff_issues / town_lists are both keyed by (volume, paper_no) - see
+    scan_tiff_directory / read_tiff_list_file and
+    resolve_town_list_volumes.
 
     problem_prefix is prepended to every problem line (e.g. "[Vol_09] ")
     so problems from multiple sources can be told apart in one report;
@@ -1269,17 +1459,18 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     records = []
     problems = []
 
-    town_list_paper_nos = set(town_lists.keys())
-    tiff_paper_nos = set(tiff_issues.keys())
-    only_in_town_list = town_list_paper_nos - tiff_paper_nos
-    only_in_tiffs = tiff_paper_nos - town_list_paper_nos
+    town_keys = set(town_lists.keys())
+    tiff_keys = set(tiff_issues.keys())
+    only_in_town_list = town_keys - tiff_keys
+    only_in_tiffs = tiff_keys - town_keys
 
-    for paper_no in sorted(only_in_town_list):
+    for key in sorted(only_in_town_list):
+        volume, paper_no = key
         problems.append(
-            f"{problem_prefix}[missing_tiffs] Town List has paper "
-            f"#{paper_no} with towns "
-            f"({MULTI_SEP.join(town_lists[paper_no])}), but no TIFF for "
-            f"that paper number was found in {source_label}."
+            f"{problem_prefix}[missing_tiffs] Town List has Vol_{volume} "
+            f"paper #{paper_no} with towns "
+            f"({MULTI_SEP.join(town_lists[key])}), but no matching TIFF "
+            f"was found in {source_label}."
         )
 
     for item in unrecognized_items:
@@ -1288,10 +1479,10 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
             f"match the expected pattern and was skipped."
         )
 
-    for paper_no, issue in tiff_issues.items():
-        record = compute_issue_record(paper_no, issue, town_lists)
-        record["source_volume"] = source_label
-        if paper_no in only_in_tiffs:
+    for key, issue in tiff_issues.items():
+        record = compute_issue_record(key, issue, town_lists)
+        record["source_volume"] = f"Vol_{key[0]}"
+        if key in only_in_tiffs:
             problems.append(
                 f"{problem_prefix}[missing_town_list] Issue "
                 f"{record['issue_id']} has no Town List entry - included "
@@ -1300,34 +1491,6 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
         records.append(record)
 
     return records, problems
-
-
-def gather_records_from_pairs(directory, pairs):
-    """
-    Read every Vol_xx pair and turn them all into one combined list of
-    issue records + problem descriptions, tagged per-volume.
-    """
-    all_records = []
-    all_problems = []
-
-    for vol_text, tiff_filename, townlist_filename in pairs:
-        base_name = f"Vol_{vol_text}"
-        tiff_path = os.path.join(directory, tiff_filename)
-        townlist_path = os.path.join(directory, townlist_filename)
-
-        print(f"Reading {base_name}: {townlist_filename} + {tiff_filename}")
-        grid = read_grid(townlist_path)
-        town_lists = parse_town_list(grid)
-        tiff_issues, unrecognized_items = read_tiff_list_file(tiff_path)
-
-        records, problems = records_from_single_source(
-            tiff_issues, town_lists, unrecognized_items,
-            source_label=tiff_filename, problem_prefix=f"[{base_name}] ",
-        )
-        all_records.extend(records)
-        all_problems.extend(problems)
-
-    return all_records, all_problems
 
 
 def merge_and_write_records(directory, all_records, volume_problems, source_line):
@@ -1407,7 +1570,9 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
         active_file = None
         if existing_files:
             candidate = existing_files[-1]  # chronologically latest
-            if 1 + len(candidate["rows"]) < TARGET_LINES_PER_FILE:
+            new_records_min_year = min(int(r["year"]) for r in new_records)
+            year_gap = new_records_min_year - int(candidate["end_year"]) > MAX_CONTIGUOUS_YEAR_GAP
+            if 1 + len(candidate["rows"]) < TARGET_LINES_PER_FILE and not year_gap:
                 active_file = candidate
 
         taken_names = {info["filename"] for info in existing_files}
@@ -1540,25 +1705,27 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
 
 def run_by_year(directory):
     """
-    The default directory-scanning mode: read every Vol_xx pair found in
-    `directory` and merge them all in. See the module comment above for
-    the merge/dedup rules and file-naming convention.
+    The default directory-scanning mode: read every tifflist and Town
+    List file found anywhere in `directory` and merge them all in - no
+    filename pairing required. See the module comment above for the
+    merge/dedup rules and file-naming convention.
     """
-    print(f"Scanning {directory} for Vol_xx file pairs...")
-    pairs = find_volume_pairs(directory)
-    if not pairs:
-        print("No Vol_xx_tifflist.txt / Vol_xx_Town_List.xlsx pairs found.")
+    print(f"Scanning {directory} for tifflist and Town List files...")
+    all_records, problems, tiff_filenames, townlist_filenames = gather_all_records(directory)
+
+    if not tiff_filenames and not townlist_filenames:
+        print("No tifflist or Town List files found.")
         return
 
-    print(f"Found {len(pairs)} volume pair(s): "
-          + ", ".join(f"Vol_{v}" for v, _, _ in pairs))
+    print(f"Found {len(tiff_filenames)} tifflist file(s) and "
+          f"{len(townlist_filenames)} Town List file(s).")
     print()
 
-    all_records, volume_problems = gather_records_from_pairs(directory, pairs)
     source_line = (
-        f"Volume pairs read: {', '.join(f'Vol_{v}' for v, _, _ in pairs)}"
+        f"Tifflist files read: {', '.join(tiff_filenames) or '(none)'}\n"
+        f"Town List files read: {', '.join(townlist_filenames) or '(none)'}"
     )
-    merge_and_write_records(directory, all_records, volume_problems, source_line)
+    merge_and_write_records(directory, all_records, problems, source_line)
 
 
 # =============================================================================
@@ -1568,10 +1735,11 @@ def run_by_year(directory):
 def main():
     args = sys.argv[1:]
 
-    # ---- --edit-notes: update the NOTES constant, no other args needed ----
-    if args == ["--edit-notes"]:
-        edit_notes_interactively()
-        return
+    try:
+        load_notes()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
     # ---- A single directory argument (with or without the explicit
     # --by-year flag) - the DEFAULT mode: read every Vol_xx pair found in
@@ -1599,7 +1767,6 @@ def main():
         print("      (default: read every Vol_xx pair in <directory> and merge them)")
         print("  python build_issue_csv.py <tiff_directory_or_listing_file> <townlist_file_or_google_sheet_url>")
         print("      (manual mode, for one-off files that don't follow the Vol_xx naming)")
-        print("  python build_issue_csv.py --edit-notes")
         sys.exit(1)
 
     tiff_source = args[0]
@@ -1611,11 +1778,6 @@ def main():
     if not is_google_sheets_url(townlist_file) and not os.path.isfile(townlist_file):
         print(f"ERROR: Town List file not found: {townlist_file}")
         sys.exit(1)
-
-    print(f"Reading Town List: {townlist_file}")
-    grid = read_grid(townlist_file)
-    town_lists = parse_town_list(grid)
-    print(f"  Found {len(town_lists)} issue(s) in the Town List.")
 
     # ---- Figure out what kind of thing tiff_source is, and read it ----
     if os.path.isdir(tiff_source):
@@ -1645,10 +1807,19 @@ def main():
         print(f"  ({len(unrecognized_items)} {noun} didn't match the expected "
               f"naming pattern and will be skipped - see the process report.)")
 
+    print(f"Reading Town List: {townlist_file}")
+    grid = read_grid(townlist_file)
+    raw_town_lists = parse_town_list(grid)
+    town_lists, resolve_problems = resolve_town_list_volumes(
+        raw_town_lists, tiff_issues, filename_hint=os.path.basename(townlist_file)
+    )
+    print(f"  Found {len(town_lists)} issue(s) in the Town List.")
+
     print("Merging into output files...")
     records, problems = records_from_single_source(
         tiff_issues, town_lists, unrecognized_items, source_label=source_label,
     )
+    problems.extend(f"[{townlist_file}] {p}" for p in resolve_problems)
     source_line = f"Source: {tiff_source} + {townlist_file}"
     merge_and_write_records(output_dir, records, problems, source_line)
 

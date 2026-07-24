@@ -1,0 +1,25 @@
+# notes_config.txt
+#
+# This file supplies the "notes" field (column AB) that gets attached to
+# every issue in the ingest CSV. Edit this file directly to add, remove,
+# or change a credit - no code changes needed, and build_issue_csv.py
+# does NOT need to be re-run through Claude to pick up your edits.
+#
+# Format: one credit per line, exactly like this:
+#     note_type: note text
+#
+# The note_type for all of these should be "creation/production credits"
+# unless you have a specific reason to use a different value from the
+# repository's controlled vocabulary for notes.
+#
+# Blank lines and lines starting with "#" (like this one) are ignored,
+# so feel free to leave comments or extra spacing for readability.
+#
+# This file must live in the SAME FOLDER as build_issue_csv.py.
+
+creation/production credits: Deep River Public Library -- Patrick McGlamery
+creation/production credits: Chester Historical Society -- Adrian Nicholls
+creation/production credits: Westbrook Historical Society -- Sandy Forest
+creation/production credits: Deep River Historical Society--Simon LaPlace
+creation/production credits: Deep River Public Library--AC Proctor
+creation/production credits: Deep River Public Library--Lois Blood Bennett
