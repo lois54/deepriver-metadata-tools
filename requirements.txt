@@ -1,0 +1,9 @@
+# build_issue_csv.py's own dependency - only actually exercised when a
+# Town List file is .xlsx rather than .csv or a Google Sheets URL, but
+# harmless to always have installed.
+openpyxl
+
+# run_from_drive.py's dependencies - talking to the Drive API.
+google-api-python-client
+google-auth
+google-auth-httplib2

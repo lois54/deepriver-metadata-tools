@@ -47,10 +47,25 @@ import subprocess
 import time
 
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.auth.transport.requests import Request as OAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# The service account's SCOPES above stays broad, since it only ever
+# reads and updates files it's already been shared on as Editor - it
+# never needs to create anything new.
+#
+# For CREATING new files, we use a separate OAuth credential instead,
+# scoped narrowly to drive.file (see get_refresh_token.py). This is the
+# workaround for a Google Drive quirk: service accounts have no storage
+# quota of their own, so they can't own brand-new files sitting in a
+# personal (non-Workspace) Google account's Drive - only a real person's
+# credential can. Updates to EXISTING files don't have this problem,
+# since ownership never changes on an update - only creation.
+OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 # Files we never want to touch during download/upload - they're not part
 # of the actual data, just noise that can show up in a folder listing.
@@ -73,6 +88,51 @@ def get_drive_service():
     creds = service_account.Credentials.from_service_account_file(
         key_path, scopes=SCOPES
     )
+    return build("drive", "v3", credentials=creds)
+
+
+def get_oauth_drive_service():
+    """
+    Builds an authenticated connection to the Drive API using the OAuth
+    refresh token (drive.file scope) instead of the service account.
+    This is the credential used specifically for CREATING new files,
+    since it acts as a real Google account with real storage quota,
+    rather than a service account (which has none).
+
+    Reads three environment variables, set by get_refresh_token.py's
+    one-time output and stored as GitHub secrets:
+        GDRIVE_OAUTH_CLIENT_ID
+        GDRIVE_OAUTH_CLIENT_SECRET
+        GDRIVE_OAUTH_REFRESH_TOKEN
+    """
+    client_id = os.environ.get("GDRIVE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GDRIVE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GDRIVE_OAUTH_REFRESH_TOKEN")
+
+    missing = [
+        name for name, value in [
+            ("GDRIVE_OAUTH_CLIENT_ID", client_id),
+            ("GDRIVE_OAUTH_CLIENT_SECRET", client_secret),
+            ("GDRIVE_OAUTH_REFRESH_TOKEN", refresh_token),
+        ] if not value
+    ]
+    if missing:
+        print(f"ERROR: missing environment variable(s): {', '.join(missing)}")
+        sys.exit(1)
+
+    creds = OAuthCredentials(
+        token=None,  # no access token yet - refreshed immediately below
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=OAUTH_SCOPES,
+    )
+    # The refresh token doesn't expire, but the short-lived access token
+    # it produces does - this exchanges it for a fresh one right away,
+    # the same thing that would happen automatically on first API use.
+    creds.refresh(OAuthRequest())
+
     return build("drive", "v3", credentials=creds)
 
 
@@ -121,11 +181,16 @@ def download_file(service, file_id, destination_path):
             _, done = downloader.next_chunk()
 
 
-def upload_new_file(service, folder_id, local_path, name):
-    """Creates a brand-new file in the Drive folder."""
+def upload_new_file(oauth_service, folder_id, local_path, name):
+    """
+    Creates a brand-new file in the Drive folder. Takes the OAUTH
+    service specifically, not the service account service - service
+    accounts can't own new files in a personal Drive (see the SCOPES
+    comment near the top of this file).
+    """
     media = MediaFileUpload(local_path, resumable=True)
     metadata = {"name": name, "parents": [folder_id]}
-    service.files().create(body=metadata, media_body=media, fields="id").execute()
+    oauth_service.files().create(body=metadata, media_body=media, fields="id").execute()
     print(f"  uploaded (new): {name}")
 
 
@@ -143,6 +208,7 @@ def main():
         sys.exit(1)
 
     service = get_drive_service()
+    oauth_service = get_oauth_drive_service()
 
     # ---- Step 1: DOWNLOAD ----
     print(f"Listing files in Drive folder {folder_id} ...")
@@ -205,7 +271,7 @@ def main():
         if filename in name_to_id:
             update_existing_file(service, name_to_id[filename], local_path, filename)
         else:
-            upload_new_file(service, folder_id, local_path, filename)
+            upload_new_file(oauth_service, folder_id, local_path, filename)
         uploaded_count += 1
 
     print()
