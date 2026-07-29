@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-29 11:05 AM EDT
+# Generated: 2026-07-29 11:35 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -1005,6 +1005,32 @@ def scan_tiff_directory(tiff_dir):
     return issues_by_key, unrecognized_files
 
 
+def read_text_lines(path):
+    """
+    Read a text file's lines, tolerating the couple of different
+    encodings contributors' files show up in.
+
+    The common case is plain UTF-8 (with or without a byte-order mark).
+    The other case worth handling: UTF-16, which shows up when a
+    Windows "dir" listing gets redirected straight to a file using
+    PowerShell's default encoding (e.g. `Get-ChildItem | Out-File
+    tifflist.txt`) - PowerShell writes UTF-16 with a byte-order mark by
+    default, not UTF-8, even though the file looks completely normal
+    when opened in a text editor.
+
+    Tries UTF-8 first, falls back to UTF-16 if that fails to decode,
+    and re-raises the original error if neither works - a file that's
+    neither of those is something genuinely unexpected, worth seeing
+    the real error for rather than masking it.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return f.readlines()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="utf-16") as f:
+            return f.readlines()
+
+
 def read_tiff_list_file(list_file_path):
     """
     Read TIFF filenames out of a plain CSV or text "listing" file instead
@@ -1034,46 +1060,46 @@ def read_tiff_list_file(list_file_path):
     issues_by_key = {}
     unrecognized_lines = []
 
-    # "utf-8-sig" quietly strips a byte-order-mark if the file has one
-    # (common in files saved from Windows tools). Universal newline
-    # handling (the default in text mode) takes care of \r\n line
-    # endings automatically, so we don't need to worry about those.
-    with open(list_file_path, "r", encoding="utf-8-sig") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue  # skip blank lines
+    # read_text_lines() tolerates both UTF-8 and UTF-16 (see its
+    # docstring) - the latter shows up more often than you'd expect,
+    # from Windows "dir" listings redirected via PowerShell. Universal
+    # newline handling (the default in text mode) takes care of \r\n
+    # line endings automatically, so we don't need to worry about those.
+    for raw_line in read_text_lines(list_file_path):
+        line = raw_line.strip()
+        if not line:
+            continue  # skip blank lines
 
-            match = TIFF_NAME_SEARCH_PATTERN.search(line)
-            if not match:
-                unrecognized_lines.append(line)
-                continue
+        match = TIFF_NAME_SEARCH_PATTERN.search(line)
+        if not match:
+            unrecognized_lines.append(line)
+            continue
 
-            filename = match.group(1)
+        filename = match.group(1)
 
-            parsed = parse_tiff_filename(filename)
-            if parsed is None:
-                # Shouldn't normally happen (the search pattern is a
-                # looser version of the same rule), but just in case:
-                unrecognized_lines.append(line)
-                continue
+        parsed = parse_tiff_filename(filename)
+        if parsed is None:
+            # Shouldn't normally happen (the search pattern is a
+            # looser version of the same rule), but just in case:
+            unrecognized_lines.append(line)
+            continue
 
-            issue_id, date_iso, volume, paper_no, page_number = parsed
-            key = (volume, paper_no)
+        issue_id, date_iso, volume, paper_no, page_number = parsed
+        key = (volume, paper_no)
 
-            if key not in issues_by_key:
-                issues_by_key[key] = {
-                    "issue_id": issue_id,
-                    "date": date_iso,
-                    "volume": volume,
-                    "pages": [],
-                }
+        if key not in issues_by_key:
+            issues_by_key[key] = {
+                "issue_id": issue_id,
+                "date": date_iso,
+                "volume": volume,
+                "pages": [],
+            }
 
-            issues_by_key[key]["pages"].append({
-                "filename": filename,
-                "page_number": page_number,
-                "digital_file": build_digital_file(date_iso, filename),
-            })
+        issues_by_key[key]["pages"].append({
+            "filename": filename,
+            "page_number": page_number,
+            "digital_file": build_digital_file(date_iso, filename),
+        })
 
     return issues_by_key, unrecognized_lines
 
@@ -1304,8 +1330,7 @@ def file_contains_tiff_filenames(path):
     filename once, e.g. in a comment or a report.
     """
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            lines = [line for line in f if line.strip()]
+        lines = [line for line in read_text_lines(path) if line.strip()]
     except (UnicodeDecodeError, OSError):
         return False  # not a readable text file at all
 
