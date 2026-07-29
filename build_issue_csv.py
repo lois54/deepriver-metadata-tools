@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-29 10:35 AM EDT
+# Generated: 2026-07-29 11:05 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -1287,11 +1287,67 @@ def chunk_records_by_line_limit(records, start_line_count=1,
 # in a directory (used by --by-year / merge mode below).
 # =============================================================================
 
+def file_contains_tiff_filenames(path):
+    """
+    Peek at a file's CONTENT (not its name) and decide whether it looks
+    like a tifflist - i.e. whether most of its non-blank lines contain
+    a recognizable TIFF filename (see TIFF_NAME_SEARCH_PATTERN).
+
+    This is a fallback for files whose name doesn't cleanly follow the
+    "...tifflist.txt" convention - e.g. a contributor naming their file
+    "tifflist07282026.txt" (a date tacked on after the keyword, so
+    TIFFLIST_FILENAME_PATTERN doesn't match it) - so a file isn't
+    skipped just because of how it happened to get named.
+
+    Requiring a strong MAJORITY of lines to match (not just one) avoids
+    misidentifying some unrelated file that merely mentions a TIFF
+    filename once, e.g. in a comment or a report.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            lines = [line for line in f if line.strip()]
+    except (UnicodeDecodeError, OSError):
+        return False  # not a readable text file at all
+
+    if not lines:
+        return False
+
+    matching = sum(1 for line in lines if TIFF_NAME_SEARCH_PATTERN.search(line))
+    return matching / len(lines) >= 0.5
+
+
 def find_tiff_source_files(directory):
-    """Every file in `directory` that looks like a tifflist, by name."""
-    return sorted(
-        f for f in os.listdir(directory) if TIFFLIST_FILENAME_PATTERN.match(f)
-    )
+    """
+    Every file in `directory` that's a tifflist - matched primarily by
+    NAME (see TIFFLIST_FILENAME_PATTERN), with a CONTENT-based fallback
+    (see file_contains_tiff_filenames) for .txt/.csv files that don't
+    follow the naming convention but are clearly full of TIFF filenames
+    once you actually look inside.
+
+    Files already recognized as a Town List by name are never
+    considered here, even if they happened to contain TIFF-shaped text
+    somewhere - a file can't be both.
+    """
+    by_name = []
+    maybe_by_content = []
+
+    for f in sorted(os.listdir(directory)):
+        path = os.path.join(directory, f)
+        if not os.path.isfile(path):
+            continue
+        if TIFFLIST_FILENAME_PATTERN.match(f):
+            by_name.append(f)
+        elif f.lower().endswith((".txt", ".csv")) and not is_town_list_filename(f):
+            maybe_by_content.append(f)
+
+    by_content = [
+        f for f in maybe_by_content
+        if file_contains_tiff_filenames(os.path.join(directory, f))
+    ]
+    for f in by_content:
+        print(f"  (recognized '{f}' as a tifflist by its content, not its name)")
+
+    return sorted(by_name + by_content)
 
 
 def find_town_list_source_files(directory):
