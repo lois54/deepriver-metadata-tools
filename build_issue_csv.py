@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-24 03:09 PM EDT
+# Generated: 2026-07-29 10:35 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -580,17 +580,27 @@ def parse_town_list(grid):
     Parse a Town List grid (see read_grid) into a dictionary that maps:
         paper number (int)  ->  list of town names (list of str)
 
-    Auto-detects whether the grid is in "Format A" (one row per issue,
-    towns spread across columns) or "Format B" (one column per issue,
-    towns stacked down rows) and calls the matching parser below.
+    Auto-detects which of THREE possible layouts the grid is in, and
+    calls the matching parser below:
+        Format A - one row per issue, "No." column, towns across columns
+        Format B - "Paper No." header row, towns stacked down columns
+        Format C - "Slim" layout with pre-filled Subject/Geographic
+                   columns instead of plain town names (see
+                   parse_format_c_slim for details)
     """
     if not grid or not grid[0]:
         raise ValueError("Town List file appears to be empty.")
 
     header_row = grid[0]
+    header_lower = [cell.strip().lower() for cell in header_row]
     first_cell = header_row[0].lower()
 
-    if first_cell.startswith("paper"):
+    if "subject" in header_lower and "geographic" in header_lower:
+        # A "Subject" AND "Geographic" column together is a distinctive
+        # fingerprint of the Slim format - neither Format A nor B ever
+        # has both of these as column headers.
+        return parse_format_c_slim(grid)
+    elif first_cell.startswith("paper"):
         # e.g. header_row[0] == "Paper No." -> issue numbers run ACROSS
         # this row, and towns are stacked DOWN each column below it.
         return parse_format_b_transposed(grid)
@@ -722,6 +732,69 @@ def parse_format_b_transposed(grid):
                     towns.append(town)
 
         town_list[(None, paper_no)] = towns
+
+    return town_list
+
+
+SUBJECT_ENTRY_PATTERN = re.compile(r'^Newspaper -- (.+), CT$')
+
+
+def parse_format_c_slim(grid):
+    """
+    Parse the "Slim" layout some contributors have started sending,
+    where the Subject and Geographic Subject columns are ALREADY
+    filled in with Islandora's exact expected wording, rather than
+    plain town names:
+
+        Filelist.txt              | ... | Subject                          | Geographic
+        19090115_vXXXVI_n01.pdf   | ... | Newspaper -- Deep River, CT^^...  | Deep River (Conn.)^^...
+
+    Rather than trust the Geographic column on its own (which could in
+    theory drift out of sync with Subject if someone hand-edits one and
+    not the other), we pull the plain town names back OUT of the
+    Subject column instead - stripping the "Newspaper -- " prefix and
+    ", CT" suffix off each ^^-separated entry - and hand those back to
+    build_subject_and_geo() later, exactly like every other format.
+    This keeps the final CSV's formatting identical no matter which
+    Town List format supplied it, and means a typo in the Geographic
+    column alone can't slip through uncaught.
+
+    Each issue is identified by parsing the reference filename in
+    column 0 (the same pattern "Old Method" Format A files use for
+    their reference column - see parse_issue_prefix), so this format
+    supplies its own per-row volume; no fallback is needed.
+
+    Any row whose filename doesn't parse, or whose Subject cell is
+    blank, is skipped quietly - it'll simply show up later as a
+    missing_town_list problem for that issue, same as any other gap.
+
+    Returns dict[(volume, paper_no)] -> list of town names, same shape
+    as every other format's parser.
+    """
+    header_row = grid[0]
+    header_lower = [cell.strip().lower() for cell in header_row]
+    subject_col = header_lower.index("subject")
+
+    town_list = {}
+
+    for row in grid[1:]:
+        if not row or not row[0].strip():
+            continue
+
+        parsed = parse_issue_prefix(row[0])
+        if parsed is None:
+            continue  # not a recognizable "yyyymmdd_vVOL_nNN..." filename
+
+        volume, paper_no = parsed
+
+        towns = []
+        if subject_col < len(row) and row[subject_col].strip():
+            for entry in row[subject_col].split(MULTI_SEP):
+                match = SUBJECT_ENTRY_PATTERN.match(entry.strip())
+                if match:
+                    towns.append(match.group(1))
+
+        town_list[(volume, paper_no)] = towns
 
     return town_list
 
@@ -1375,6 +1448,33 @@ def gather_all_records(directory):
 # target is left alone and a new file is started instead.
 # =============================================================================
 
+def write_matching_xlsx(csv_path):
+    """
+    Write an .xlsx copy of an ingest CSV file that was just written or
+    updated, so contributors who prefer opening things in Excel don't
+    have to convert it by hand.
+
+    This is purely a courtesy copy - the CSV remains the file this
+    script actually reads back in on future runs (see
+    find_ingest_files / INGEST_FILENAME_PATTERN, which only ever
+    matches ".csv"). The .xlsx is regenerated fresh from the CSV's
+    final content every time it changes, and is never itself read by
+    anything - so there's no risk of the two ever silently disagreeing.
+    """
+    import openpyxl
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+
+    xlsx_path = os.path.splitext(csv_path)[0] + ".xlsx"
+    workbook.save(xlsx_path)
+
+
 def normalize_for_compare(row):
     """
     Prepare a parent row dict for an equality check against another copy
@@ -1637,6 +1737,12 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
                 written_files.append(path)
 
             added_total += len(chunk)
+
+    # Every ingest CSV that was written or updated this run gets a
+    # matching .xlsx copy, regenerated fresh from the CSV's final
+    # content (see write_matching_xlsx).
+    for path in written_files:
+        write_matching_xlsx(path)
 
     # ---- Write one consolidated report for this run ---------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
