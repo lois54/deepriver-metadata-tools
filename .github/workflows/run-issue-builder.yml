@@ -1,22 +1,29 @@
 # =============================================================================
 # RUN ISSUE BUILDER
 # =============================================================================
-# 
+# Generated: 2026-07-31 09:15 AM EDT
 #
 # Runs run_from_drive.py on a schedule, which downloads the working
 # folder from Google Drive, runs build_issue_csv.py against it locally
 # on the runner, and uploads back whatever's new or changed.
 #
-# SCHEDULE (all times below are UTC - see the comments on each line)
+# SCHEDULE
 # ----------------------------------------------------------------------------
-#   Runs every day at 09:00, 12:00, 15:00, 18:00 and 21:00
+#   Runs every day at 9:07am, 12:07pm, 3:07pm, 6:07pm, and 9:07pm Eastern.
 #
-# GitHub Actions cron always runs in UTC and has no concept of daylight
-# saving time. The lines below are written for EDT (UTC-4), which is
-# correct roughly mid-March through early November. When clocks fall
-# back to EST (UTC-5) in early November, add 1 to each hour below; when
-# they spring forward to EDT again in March, subtract 1. A day or two
-# of drift right around the change itself isn't worth worrying about.
+# This uses GitHub's "timezone" field (added March 2026) to schedule
+# directly in Eastern time, rather than doing UTC math by hand. GitHub
+# automatically adjusts for daylight saving - no biannual hour
+# adjustment needed anymore, unlike the very first version of this file.
+#
+# The schedule is offset to :07 past the hour rather than exactly on
+# the hour. GitHub's own docs warn that scheduled runs can be delayed
+# or, under high load, dropped entirely - and load is highest right at
+# the top of every hour, since that's when the most schedules across
+# all of GitHub fire at once. A few minutes' offset avoids that spike.
+# Even so, GitHub gives no guaranteed exact-time SLA for scheduled
+# runs - occasional delays of a few minutes are normal and not a sign
+# of anything broken.
 #
 # MANUAL RUNS
 # ----------------------------------------------------------------------------
@@ -29,10 +36,8 @@ name: Run Issue Builder
 
 on:
   schedule:
-    # Weekdays (Mon-Fri), every 30 min, 7am-11pm Eastern (EDT = UTC-4)
-    - cron: '0 9,12,15,18,21 * * *'
-    # Weekends (Sat-Sun), once an hour, same window
-    # - cron: '0 11-23,0-3 * * 0,6'
+    - cron: '7 9,12,15,18,21 * * *'
+      timezone: "America/New_York"
   workflow_dispatch: {}
 
 permissions:
