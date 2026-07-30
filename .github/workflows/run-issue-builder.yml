@@ -31,9 +31,9 @@ name: Run Issue Builder
 on:
   schedule:
     # Weekdays (Mon-Fri), every 30 min, 7am-11pm Eastern (EDT = UTC-4)
-    - cron: '0,30 11-23,0-3 * * 1-5'
+    - cron: '0 9,12,15,18,21 * * *'
     # Weekends (Sat-Sun), once an hour, same window
-    - cron: '0 11-23,0-3 * * 0,6'
+    # - cron: '0 11-23,0-3 * * 0,6'
   workflow_dispatch: {}
 
 permissions:
