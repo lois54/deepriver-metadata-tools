@@ -1,7 +1,7 @@
 # =============================================================================
 # RUN ISSUE BUILDER
 # =============================================================================
-# Generated: 2026-07-28 01:20 PM EDT
+# 
 #
 # Runs run_from_drive.py on a schedule, which downloads the working
 # folder from Google Drive, runs build_issue_csv.py against it locally
@@ -9,8 +9,7 @@
 #
 # SCHEDULE (all times below are UTC - see the comments on each line)
 # ----------------------------------------------------------------------------
-#   Weekdays: every 30 minutes, 7am-11pm Eastern
-#   Weekends: once an hour, same 7am-11pm Eastern window
+#   Runs every day at 09:00, 12:00, 15:00, 18:00 and 21:00
 #
 # GitHub Actions cron always runs in UTC and has no concept of daylight
 # saving time. The lines below are written for EDT (UTC-4), which is
