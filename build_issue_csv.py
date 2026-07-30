@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-29 11:35 AM EDT
+# Generated: 2026-07-30 11:35 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -1357,12 +1357,28 @@ def find_tiff_source_files(directory):
     maybe_by_content = []
 
     for f in sorted(os.listdir(directory)):
+        if f.startswith("."):
+            continue  # bookkeeping files (run log, etc.) are never data inputs
         path = os.path.join(directory, f)
         if not os.path.isfile(path):
             continue
         if TIFFLIST_FILENAME_PATTERN.match(f):
             by_name.append(f)
-        elif f.lower().endswith((".txt", ".csv")) and not is_town_list_filename(f):
+        elif (
+            f.lower().endswith((".txt", ".csv"))
+            and not is_town_list_filename(f)
+            and not INGEST_FILENAME_PATTERN.match(f)
+            and not f.startswith("Ingest_merge_report_")
+        ):
+            # The content-sniffing fallback below is for INPUT files a
+            # contributor named unexpectedly - never for this script's
+            # OWN output. An ingest CSV's digital_file column is full of
+            # genuine TIFF filenames, which would otherwise trip the
+            # same content check and get read back in as if it were a
+            # fresh tifflist - feeding the script's own output back
+            # into itself. Both output filename patterns are excluded
+            # explicitly here, rather than relying on content alone to
+            # tell the difference.
             maybe_by_content.append(f)
 
     by_content = [
@@ -1377,7 +1393,10 @@ def find_tiff_source_files(directory):
 
 def find_town_list_source_files(directory):
     """Every file in `directory` that looks like a Town List, by name."""
-    return sorted(f for f in os.listdir(directory) if is_town_list_filename(f))
+    return sorted(
+        f for f in os.listdir(directory)
+        if not f.startswith(".") and is_town_list_filename(f)
+    )
 
 
 def resolve_town_list_volumes(town_lists, tiff_issues, filename_hint=None):
@@ -1674,6 +1693,66 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     return records, problems
 
 
+LOGS_SUBDIR_NAME = "_Logs"
+RUN_LOG_FILENAME = "run_log.txt"
+LAST_PROBLEMS_FILENAME = "last_problems.txt"
+
+
+def logs_dir_path(directory):
+    """
+    The local _Logs subfolder used for bookkeeping files (the run log
+    and the last-run problem set) - kept separate from the main folder
+    so they don't clutter the listing anyone browsing Drive sees.
+
+    Originally these were dot-prefixed files instead of a subfolder,
+    on the assumption a leading dot would hide them the way it does in
+    Finder - but Google Drive's web interface doesn't honor that
+    convention, so they showed up in the listing like anything else.
+    A real subfolder actually keeps them out of the main listing,
+    since run_from_drive.py already skips subfolders entirely when
+    syncing the main folder (see its comments) - this one just gets
+    synced separately, to its own place in Drive.
+
+    Creates the subfolder locally if it doesn't exist yet.
+    """
+    path = os.path.join(directory, LOGS_SUBDIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def append_run_log(directory, message):
+    """
+    Append one line to a small, ongoing log of every time this script
+    has run - kept in the _Logs subfolder, separate from the full
+    Ingest_merge_report files, so routine "nothing changed" runs
+    (which, on a schedule running 5x a day, is most of them) don't
+    pile up files for everyone browsing the main Drive folder.
+    """
+    log_path = os.path.join(logs_dir_path(directory), RUN_LOG_FILENAME)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp}  {message}\n")
+
+
+def read_last_problems(directory):
+    """The set of problem strings recorded at the end of the PREVIOUS
+    run, so this run can tell whether anything actually changed."""
+    path = os.path.join(logs_dir_path(directory), LAST_PROBLEMS_FILENAME)
+    if not os.path.isfile(path):
+        return set()
+    with open(path, "r", encoding="utf-8") as f:
+        return {line.rstrip("\n") for line in f if line.strip()}
+
+
+def write_last_problems(directory, problems):
+    """Overwrite the saved problem set with THIS run's, for next time's
+    comparison. Always called, whether or not a report gets written."""
+    path = os.path.join(logs_dir_path(directory), LAST_PROBLEMS_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        for p in sorted(problems):
+            f.write(p + "\n")
+
+
 def merge_and_write_records(directory, all_records, volume_problems, source_line):
     """
     The shared merge/dedup/write engine, used by BOTH the default
@@ -1825,50 +1904,78 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
     for path in written_files:
         write_matching_xlsx(path)
 
-    # ---- Write one consolidated report for this run ---------------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = os.path.join(directory, f"Ingest_merge_report_{timestamp}.txt")
+    # ---- Decide whether this run is worth a full report -----------------
+    # "Noteworthy" means: something NEW happened - issues added, a
+    # mismatch that needs review, or the set of problems is different
+    # from what last run already reported. A problem that's still
+    # exactly the same as last time (e.g. one issue permanently missing
+    # a TIFF) doesn't get reported again every single run - it already
+    # made it into a report once, and nothing about it has changed
+    # since. This matters a lot now that this runs 5x a day rather than
+    # on-demand - most runs genuinely have nothing new to say.
+    current_problems = set(volume_problems)
+    problems_changed = current_problems != read_last_problems(directory)
+    noteworthy = bool(added_total) or bool(mismatch_lines) or problems_changed
 
-    lines = [
-        "Ingest merge report",
-        f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Directory: {directory}",
-        source_line,
-        "",
-        f"New issues added: {added_total} ({new_pages_total} pages)",
-        f"Already present (unchanged): {matched_count} ({matched_pages_total} pages)",
-        f"Duplicates with differing data (needs review): {len(mismatch_lines)} ({mismatch_pages_total} pages)",
-        "",
-    ]
+    report_path = None
+    if noteworthy:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(directory, f"Ingest_merge_report_{timestamp}.txt")
 
-    if counts_by_source:
-        lines.append("Breakdown by source:")
-        for source in sorted(counts_by_source):
-            c = counts_by_source[source]
-            lines.append(
-                f"  - {source}: {c['new']} new ({c['new_pages']} pages), "
-                f"{c['matched']} already present ({c['matched_pages']} pages), "
-                f"{c['mismatch']} differing ({c['mismatch_pages']} pages)"
-            )
-        lines.append("")
+        lines = [
+            "Ingest merge report",
+            f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Directory: {directory}",
+            source_line,
+            "",
+            f"New issues added: {added_total} ({new_pages_total} pages)",
+            f"Already present (unchanged): {matched_count} ({matched_pages_total} pages)",
+            f"Duplicates with differing data (needs review): {len(mismatch_lines)} ({mismatch_pages_total} pages)",
+            "",
+        ]
 
-    if written_files:
-        lines.append("Files written/updated:")
-        lines.extend(f"  - {path}" for path in written_files)
-        lines.append("")
+        if counts_by_source:
+            lines.append("Breakdown by source:")
+            for source in sorted(counts_by_source):
+                c = counts_by_source[source]
+                lines.append(
+                    f"  - {source}: {c['new']} new ({c['new_pages']} pages), "
+                    f"{c['matched']} already present ({c['matched_pages']} pages), "
+                    f"{c['mismatch']} differing ({c['mismatch_pages']} pages)"
+                )
+            lines.append("")
 
-    if mismatch_lines:
-        lines.append("DUPLICATES WITH DIFFERING DATA:")
-        lines.extend(mismatch_lines)
-        lines.append("")
+        if written_files:
+            lines.append("Files written/updated:")
+            lines.extend(f"  - {path}" for path in written_files)
+            lines.append("")
 
-    if volume_problems:
-        lines.append("OTHER PROBLEMS (from reading the source files):")
-        lines.extend(f"  - {p}" for p in volume_problems)
-        lines.append("")
+        if mismatch_lines:
+            lines.append("DUPLICATES WITH DIFFERING DATA:")
+            lines.extend(mismatch_lines)
+            lines.append("")
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        if volume_problems:
+            lines.append("OTHER PROBLEMS (from reading the source files):")
+            lines.extend(f"  - {p}" for p in volume_problems)
+            lines.append("")
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    # The problem set is saved every run regardless of whether a report
+    # got written, so the NEXT run has something current to compare
+    # against.
+    write_last_problems(directory, current_problems)
+
+    summary = (
+        f"new={added_total} matched={matched_count} "
+        f"differing={len(mismatch_lines)} problems={len(current_problems)}"
+    )
+    if report_path:
+        append_run_log(directory, f"{summary} -> {os.path.basename(report_path)}")
+    else:
+        append_run_log(directory, f"{summary} -> nothing new since last run, no report written")
 
     print()
     print("Done!")
@@ -1887,7 +1994,11 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
         print("  Files written/updated:")
         for path in written_files:
             print(f"    - {path}")
-    print(f"  Process report: {report_path}")
+    if report_path:
+        print(f"  Process report: {report_path}")
+    else:
+        print("  Nothing new since last run - no report file written "
+              f"(see {LOGS_SUBDIR_NAME}/{RUN_LOG_FILENAME} for a record of this run).")
 
 
 def run_by_year(directory):
@@ -1902,6 +2013,7 @@ def run_by_year(directory):
 
     if not tiff_filenames and not townlist_filenames:
         print("No tifflist or Town List files found.")
+        append_run_log(directory, "no tifflist or Town List files found in this run")
         return
 
     print(f"Found {len(tiff_filenames)} tifflist file(s) and "

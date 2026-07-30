@@ -2,7 +2,7 @@
 # =============================================================================
 # RUN FROM DRIVE
 # =============================================================================
-# Generated: 2026-07-27 04:45 PM EDT
+# Generated: 2026-07-30 11:35 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -70,6 +70,47 @@ OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 # Files we never want to touch during download/upload - they're not part
 # of the actual data, just noise that can show up in a folder listing.
 IGNORED_NAMES = {".DS_Store"}
+
+# Name of the subfolder build_issue_csv.py writes its run log and
+# problem-comparison state into (see LOGS_SUBDIR_NAME in that script).
+# This gets synced separately from the main folder's contents, since
+# the main-folder sync deliberately skips ALL subfolders (see
+# list_drive_files) - this one just gets its own small sync pass.
+LOGS_SUBFOLDER_NAME = "_Logs"
+
+
+def find_or_create_subfolder(oauth_service, parent_folder_id, name):
+    """
+    Finds a subfolder by name directly inside parent_folder_id,
+    creating it if it doesn't exist yet. Creation goes through the
+    OAuth credential, not the service account - creating a folder is
+    still creating a new Drive object, which hits the same "service
+    accounts have no storage quota" restriction as creating a new file
+    (see the OAUTH_SCOPES comment above). Once created, the service
+    account can read/write inside it normally, since Drive sharing
+    permissions are inherited from the parent folder it's already been
+    shared on.
+    """
+    query = (
+        f"'{parent_folder_id}' in parents and trashed = false and "
+        f"name = '{name}' and "
+        f"mimeType = 'application/vnd.google-apps.folder'"
+    )
+    response = oauth_service.files().list(
+        q=query, spaces="drive", fields="files(id, name)"
+    ).execute()
+    matches = response.get("files", [])
+    if matches:
+        return matches[0]["id"]
+
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_folder_id],
+    }
+    folder = oauth_service.files().create(body=metadata, fields="id").execute()
+    print(f"  (created '{name}' subfolder in Drive - didn't exist yet)")
+    return folder["id"]
 
 
 def get_drive_service():
@@ -229,6 +270,23 @@ def main():
         name_to_id[f["name"]] = f["id"]
         print(f"  downloaded: {f['name']}")
 
+    # ---- Step 1b: DOWNLOAD the _Logs subfolder's contents separately ----
+    # build_issue_csv.py expects its bookkeeping files at
+    # <work_dir>/_Logs/... - this pulls down whatever's already there
+    # (the run log and last-run problem set from previous runs) so this
+    # run can read and append to them, same as it would locally.
+    logs_folder_id = find_or_create_subfolder(oauth_service, folder_id, LOGS_SUBFOLDER_NAME)
+    logs_dir = os.path.join(work_dir, LOGS_SUBFOLDER_NAME)
+    os.makedirs(logs_dir, exist_ok=True)
+
+    logs_files = list_drive_files(service, logs_folder_id)
+    logs_name_to_id = {}
+    for f in logs_files:
+        local_path = os.path.join(logs_dir, f["name"])
+        download_file(service, f["id"], local_path)
+        logs_name_to_id[f["name"]] = f["id"]
+        print(f"  downloaded ({LOGS_SUBFOLDER_NAME}): {f['name']}")
+
     # ---- Step 2: RUN ----
     # Record the time right before running, so afterward we can tell
     # which files in work_dir are new or changed (anything with a
@@ -272,6 +330,22 @@ def main():
             update_existing_file(service, name_to_id[filename], local_path, filename)
         else:
             upload_new_file(oauth_service, folder_id, local_path, filename)
+        uploaded_count += 1
+
+    # ---- Step 3b: UPLOAD anything new/changed in _Logs, separately ----
+    for filename in sorted(os.listdir(logs_dir)):
+        local_path = os.path.join(logs_dir, filename)
+        if not os.path.isfile(local_path):
+            continue
+
+        mtime = os.path.getmtime(local_path)
+        if mtime < run_started_at:
+            continue  # unchanged since before the run
+
+        if filename in logs_name_to_id:
+            update_existing_file(service, logs_name_to_id[filename], local_path, filename)
+        else:
+            upload_new_file(oauth_service, logs_folder_id, local_path, filename)
         uploaded_count += 1
 
     print()
