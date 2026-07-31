@@ -25,7 +25,6 @@
 # runs - occasional delays of a few minutes are normal and not a sign
 # of anything broken.
 #
-#
 # MANUAL RUNS
 # ----------------------------------------------------------------------------
 # This workflow can also be triggered by hand from the Actions tab on
@@ -37,8 +36,12 @@ name: Run Issue Builder
 
 on:
   schedule:
-    - cron: '7 9,12,15,18,21 * * *'
-      timezone: "America/New_York"
+    # TEMPORARY DIAGNOSTIC: every 10 minutes, bare UTC, no timezone
+    # field - testing whether GitHub's scheduler fires for this repo
+    # AT ALL, decoupled from our normal schedule/timezone combination.
+    # Revert to the real schedule once this confirms one way or the
+    # other (see the comment block above for the real 5x-a-day one).
+    - cron: '*/10 * * * *'
   workflow_dispatch: {}
 
 permissions:
