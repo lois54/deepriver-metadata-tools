@@ -1,3 +1,5 @@
+name: Schedule test
+
 on:
   schedule:
     - cron: '* * * * *'   # run every minute for testing
@@ -6,4 +8,7 @@ jobs:
   say-time:
     runs-on: ubuntu-latest
     steps:
-      - run: date && echo "SCHEDULED RUN: $(date)"
+     - name: Show time
+        run: |
+          date
+          echo "SCHEDULED RUN: $(date)"
