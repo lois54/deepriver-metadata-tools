@@ -41,7 +41,7 @@ on:
     # AT ALL, decoupled from our normal schedule/timezone combination.
     # Revert to the real schedule once this confirms one way or the
     # other (see the comment block above for the real 5x-a-day one).
-    - cron: '*/10 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch: {}
 
 permissions:
