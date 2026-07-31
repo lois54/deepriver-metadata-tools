@@ -1,0 +1,89 @@
+# =============================================================================
+# ISSUE BUILDER SCHEDULE
+# =============================================================================
+# Generated: 2026-07-31 09:10 AM EDT
+#
+# Runs run_from_drive.py on a schedule, which downloads the working
+# folder from Google Drive, runs build_issue_csv.py against it locally
+# on the runner, and uploads back whatever's new or changed.
+#
+# WHY THIS FILE HAS A NEW NAME
+# ----------------------------------------------------------------------------
+# This replaces .github/workflows/run-issue-builder.yml, which was
+# deleted. That file's SCHEDULED trigger stopped firing reliably after
+# July 30/31 - manual runs always worked, but scheduled runs only ever
+# fired once per push (a one-time "catch-up" evaluation), never
+# settling into an actual recurring schedule, even with a confirmed-
+# valid, confirmed-live cron expression sitting untouched for 45+
+# minutes. This pattern pointed at that specific workflow's schedule
+# registration being stuck on GitHub's backend, rather than anything
+# wrong with the YAML itself.
+#
+# Deleting the old file and recreating it under a NEW filename forces
+# GitHub to treat this as a brand-new workflow (a new internal workflow
+# ID), rather than an update to whatever was stuck - the standard fix
+# for this category of problem. If scheduled runs still don't fire
+# reliably under this new file after a reasonable observation window,
+# that's strong evidence the problem isn't fixable from the repo side,
+# and is worth a real GitHub Support ticket (not the AI chat) with the
+# full history attached.
+#
+# SCHEDULE
+# ----------------------------------------------------------------------------
+#   Runs every day at 9:07am, 12:07pm, 3:07pm, 6:07pm, and 9:07pm Eastern.
+#
+# Uses GitHub's "timezone" field (added March 2026) to schedule
+# directly in Eastern time - GitHub adjusts for daylight saving
+# automatically, no biannual hour adjustment needed.
+#
+# The schedule is offset to :07 past the hour rather than exactly on
+# the hour, to avoid GitHub's documented high-load window at the top
+# of every hour. Even so, GitHub gives no guaranteed exact-time SLA for
+# scheduled runs - occasional delays of a few minutes are normal.
+#
+# MANUAL RUNS
+# ----------------------------------------------------------------------------
+# This workflow can also be triggered by hand from the Actions tab on
+# GitHub (Actions -> Issue Builder Schedule -> Run workflow), without
+# waiting for the schedule - useful for testing changes.
+# =============================================================================
+
+name: Issue Builder Schedule
+
+on:
+  schedule:
+    - cron: '7 9,12,15,18,21 * * *'
+      timezone: "America/New_York"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  run-issue-builder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account key to a temp file
+        run: echo '${{ secrets.GDRIVE_SA_KEY }}' > "$RUNNER_TEMP/service_account.json"
+
+      - name: Run run_from_drive.py
+        env:
+          GDRIVE_SA_KEY_FILE: ${{ runner.temp }}/service_account.json
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_ID: ${{ secrets.GDRIVE_OAUTH_CLIENT_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET }}
+          GDRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GDRIVE_OAUTH_REFRESH_TOKEN }}
+        run: python run_from_drive.py
