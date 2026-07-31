@@ -2,7 +2,7 @@ name: Schedule test
 
 on:
   schedule:
-    - cron: '* * * * *'   # run every minute for testing
+    - cron: '* * * * *'   # run every minute for more testing
   workflow_dispatch: {}
 
 jobs:
