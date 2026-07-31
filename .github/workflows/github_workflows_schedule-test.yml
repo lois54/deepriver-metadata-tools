@@ -4,11 +4,12 @@ on:
   schedule:
     - cron: '* * * * *'   # run every minute for testing
   workflow_dispatch: {}
+
 jobs:
   say-time:
     runs-on: ubuntu-latest
     steps:
-     - name: Show time
+      - name: Show time
         run: |
           date
           echo "SCHEDULED RUN: $(date)"
