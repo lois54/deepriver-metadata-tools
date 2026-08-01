@@ -50,6 +50,9 @@
 
 name: Issue Builder Schedule
 
+runs:
+  using: 'node24'
+
 on:
   schedule:
     - cron: '47 * * * *'
@@ -58,9 +61,6 @@ on:
 
 permissions:
   contents: read
-
-runs:
-  using: 'node24'
 
 jobs:
   run-issue-builder:
