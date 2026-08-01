@@ -50,9 +50,6 @@
 
 name: Issue Builder Schedule
 
-runs:
-  using: 'node24'
-
 on:
   schedule:
     - cron: '47 * * * *'
