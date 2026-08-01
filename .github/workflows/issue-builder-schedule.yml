@@ -59,6 +59,9 @@ on:
 permissions:
   contents: read
 
+runs:
+  using: 'node24'
+
 jobs:
   run-issue-builder:
     runs-on: ubuntu-latest
