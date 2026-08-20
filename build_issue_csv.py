@@ -1161,7 +1161,7 @@ def compute_issue_record(key, issue, town_lists):
     issue_num_padded = f"{paper_no:02d}"
     date_long = format_date_long(issue["date"])
     title = (
-        f"{NEWSPAPER_NAME} - {date_long}; "
+        f"{NEWSPAPER_NAME} - {date_long}-"
         f"Vol. {issue['volume']} No. {issue_num_padded}"
     )
 
