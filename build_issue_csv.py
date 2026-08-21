@@ -1680,7 +1680,23 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
         )
 
     for key, issue in tiff_issues.items():
-        record = compute_issue_record(key, issue, town_lists)
+        try:
+            record = compute_issue_record(key, issue, town_lists)
+        except ValueError:
+            # issue["date"] didn't parse as a real calendar date (e.g. a
+            # TIFF filename with a typo'd date like "19110231" - no such
+            # thing as Feb 31). Rather than crashing the whole run, skip
+            # just this one issue and flag it for review - same pattern
+            # as missing_tiffs/missing_town_list/unrecognized_filename
+            # below. Once the source filename/date is corrected, a later
+            # run will pick the issue up normally (nothing was written
+            # for it, so there's no existing row to reconcile).
+            problems.append(
+                f"{problem_prefix}[invalid_date] Issue {issue['issue_id']} "
+                f"has an invalid date ('{issue['date']}') and was skipped - "
+                f"check the source TIFF filename(s) for a typo."
+            )
+            continue
         record["source_volume"] = f"Vol_{key[0]}"
         if key in only_in_tiffs:
             problems.append(
