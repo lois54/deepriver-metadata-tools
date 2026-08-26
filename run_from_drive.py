@@ -116,24 +116,36 @@ SUBFOLDERS = [
 SUBFOLDER_HANDLES_DELETIONS = {"DataWaiting"}
 
 
-def find_or_create_subfolder(oauth_service, parent_folder_id, name):
+def find_or_create_subfolder(service, oauth_service, parent_folder_id, name):
     """
     Finds a subfolder by name directly inside parent_folder_id,
-    creating it if it doesn't exist yet. Creation goes through the
-    OAuth credential, not the service account - creating a folder is
-    still creating a new Drive object, which hits the same "service
-    accounts have no storage quota" restriction as creating a new file
-    (see the OAUTH_SCOPES comment above). Once created, the service
-    account can read/write inside it normally, since Drive sharing
-    permissions are inherited from the parent folder it's already been
-    shared on.
+    creating it if it doesn't exist yet.
+
+    The SEARCH uses the service account (`service`), not the OAuth
+    credential - the service account already has full read access to
+    everything under the shared parent folder, including folders a
+    person created by hand in the Drive web UI. The OAuth credential
+    is deliberately narrow (drive.file scope - see OAUTH_SCOPES above),
+    which Google restricts to files/folders the OAuth app itself
+    created or that a person explicitly opened with a picker; it
+    CANNOT see a folder someone just made in their browser, no matter
+    how the parent is shared. Searching with it would silently miss
+    every manually-created folder and create a duplicate on top of it.
+
+    CREATION still goes through the OAuth credential - creating a
+    folder is still creating a new Drive object, which hits the same
+    "service accounts have no storage quota" restriction as creating a
+    new file (see the OAUTH_SCOPES comment above). Once created, the
+    service account can read/write inside it normally, since Drive
+    sharing permissions are inherited from the parent folder it's
+    already been shared on.
     """
     query = (
         f"'{parent_folder_id}' in parents and trashed = false and "
         f"name = '{name}' and "
         f"mimeType = 'application/vnd.google-apps.folder'"
     )
-    response = oauth_service.files().list(
+    response = service.files().list(
         q=query, spaces="drive", fields="files(id, name)"
     ).execute()
     matches = response.get("files", [])
@@ -299,7 +311,7 @@ def download_subfolder(service, oauth_service, parent_folder_id, name, work_dir)
     on upload, and (for DataWaiting only) to detect files that were
     moved out locally and need deleting from Drive.
     """
-    drive_folder_id = find_or_create_subfolder(oauth_service, parent_folder_id, name)
+    drive_folder_id = find_or_create_subfolder(service, oauth_service, parent_folder_id, name)
     local_dir = os.path.join(work_dir, name)
     os.makedirs(local_dir, exist_ok=True)
 
