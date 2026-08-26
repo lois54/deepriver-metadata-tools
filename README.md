@@ -15,27 +15,42 @@ formatting Islandora requires for a bulk import to succeed.
 ## What's in this repo
 
 - **`build_issue_csv.py`** — the core script. Reads TIFF scan listings
-  ("tifflist" files) and town/subject metadata ("Town List" files),
-  matches them up, and produces Islandora-compatible ingest CSVs. It's
-  idempotent: re-running it against the same data never duplicates or
-  silently overwrites previously reviewed issues. Changed data on an
+  ("tifflist" files) and town/subject metadata ("Town List" files) out
+  of a `DataWaiting` folder, matches them up, and produces
+  Islandora-compatible ingest CSVs in `IngestFiles`. It's idempotent:
+  re-running it against the same data never duplicates or silently
+  overwrites previously reviewed issues. Changed data on an
   already-processed issue gets flagged for human review rather than
-  overwritten automatically.
+  overwritten automatically. Input files that were successfully
+  processed are moved automatically into `DataFilesCompleted`; a run
+  report goes to `MergeReports` whenever something new or noteworthy
+  happens. See the script's own header comment for the full breakdown
+  of this four-folder layout.
+
+- **`check_duplicates.py`** — runs before `build_issue_csv.py`. Checks
+  every file in `DataWaiting` for duplicate entries *within* that one
+  file (the same TIFF filename listed twice, or the same paper number
+  on two rows). If it finds any, it moves the original file into
+  `DataFilesCompleted` tagged `-has_duplicates`, and leaves a corrected
+  copy behind under the original name for `build_issue_csv.py` to pick
+  up normally.
 
 - **`notes_config.txt`** — a plain text file listing the contributor
   credits attached to every issue. Editing this file is how credits get
   added or changed; no code changes needed.
 
-- **`run_from_drive.py`** — a wrapper that lets `build_issue_csv.py` run
-  automatically on a schedule via GitHub Actions, even though GitHub's
-  servers have no Google Drive folder of their own. It downloads the
-  working files from Drive into a temporary folder, runs
-  `build_issue_csv.py` against them exactly as it runs locally, then
-  uploads back whatever's new or changed.
+- **`run_from_drive.py`** — a wrapper that lets `check_duplicates.py`
+  and `build_issue_csv.py` run automatically on a schedule via GitHub
+  Actions, even though GitHub's servers have no Google Drive folder of
+  their own. It downloads each of the managed Drive subfolders
+  (`DataWaiting`, `DataFilesCompleted`, `IngestFiles`, `MergeReports`,
+  `_Logs`) into a temporary folder, runs both scripts against them
+  exactly as they'd run locally, then uploads back whatever's new,
+  changed, or moved.
 
-- **`.github/workflows/run-issue-builder.yml`** — the schedule
-  definition: runs every 30 minutes on weekdays and hourly on weekends,
-  roughly 7am–11pm Eastern.
+- **`.github/workflows/issue-builder-schedule.yml`** — the schedule
+  definition: runs five times a day (9:07am, 12:07pm, 3:07pm, 6:07pm,
+  and 9:07pm Eastern).
 
 ## Where the actual data lives
 
@@ -86,17 +101,10 @@ on a few things:
 
 ## Maintaining the schedule
 
-GitHub Actions cron schedules run in UTC and don't automatically adjust
-for daylight saving time. The schedule in
-`run-issue-builder.yml` is written for Eastern Daylight Time (UTC-4).
-Twice a year, it needs a one-hour adjustment:
-
-- **Early November** (clocks fall back to EST, UTC-5): add 1 to each
-  hour in the cron schedule.
-- **Mid-March** (clocks spring forward to EDT, UTC-4): subtract 1.
-
-A day or two of drift right around the change itself isn't worth
-worrying about.
+`issue-builder-schedule.yml` schedules directly in Eastern time, using
+GitHub Actions' `timezone` field on the cron trigger. GitHub adjusts
+for daylight saving automatically — no manual hour adjustment needed
+twice a year.
 
 ## Contributors
 

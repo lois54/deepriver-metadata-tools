@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-07-30 11:35 AM EDT
+# Generated: 2026-08-26 10:20 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -22,23 +22,52 @@
 #
 #   2. A "TOWN LIST" FILE - a spreadsheet (xlsx, csv, or a Google Sheets
 #      URL) that a human filled in by looking at each issue and writing
-#      down which towns that issue covers. This file can be in EITHER of
-#      two layouts (we auto-detect which one you gave us):
+#      down which towns that issue covers. This file can be in any of
+#      THREE layouts (we auto-detect which one you gave us) - see
+#      parse_town_list() below for the details of all three.
 #
-#        FORMAT A ("old method" - one row per issue):
-#            filename                 | No. | Subject 1  | Subject 2 | ...
-#            18850102_vXI_n39.pdf     | 39  | Deep River | Chester   | ...
-#
-#        FORMAT B ("new method" - one column per issue, towns stacked down):
-#            Paper No. | 39         | 40         | ...
-#            Towns     | Deep River | Deep River | ...
-#                       | Chester    | Chester    | ...
-#
-# WHAT THIS SCRIPT PRODUCES (written to the same folder as the TIFF
-# source - the folder itself if you gave us one, or the folder the
-# listing file lives in if you gave us that instead)
+# THE FOUR-FOLDER LAYOUT (--by-year / default mode)
 # ----------------------------------------------------------------------------
-#   <base_name>_metadata.csv
+# In this mode, `directory` (the argument you pass in) is the ROOT of a
+# folder containing four subfolders this script manages on its own
+# (created automatically if they don't exist yet):
+#
+#   DataWaiting/          new tifflist / Town List files, not yet
+#                          processed. This is the ONLY place this script
+#                          reads input from.
+#   DataFilesCompleted/   input files this script has already merged
+#                          in. Once a file contributes at least one
+#                          usable record, it's moved here automatically
+#                          at the end of a successful run - you never
+#                          need to move anything by hand. A file that
+#                          contributed NOTHING (every line/row in it
+#                          failed to parse, or it couldn't be read at
+#                          all) is left in DataWaiting instead, so it
+#                          stays visible as something that still needs
+#                          attention.
+#   IngestFiles/          the "start-end-ingest.csv" files (+ matching
+#                          .xlsx) - the finished, ready-for-the-repository
+#                          output. Read on every run to check for
+#                          existing issues, written/updated with new ones.
+#   MergeReports/         Ingest_merge_report_<timestamp>.txt - written
+#                          only on a "noteworthy" run (see
+#                          merge_and_write_records()).
+#
+# _Logs/ (a running run_log.txt and the last run's problem set) lives at
+# the ROOT, alongside these four, and is unaffected by any of this - see
+# LOGS_SUBDIR_NAME below. An Archive/ folder may also exist at the root
+# for occasional manual use; this script never touches it.
+#
+# Before this script runs, a separate script - check_duplicates.py -
+# is expected to have already checked DataWaiting for files with
+# duplicate entries WITHIN themselves, and fixed any it found (see that
+# script's own header for details). This script doesn't know or care
+# whether that happened; it just reads whatever's sitting in
+# DataWaiting when it runs.
+#
+# WHAT THIS SCRIPT PRODUCES
+# ----------------------------------------------------------------------------
+#   <start_year>-<end_year>-ingest.csv  (in IngestFiles/)
 #       This is the FULL, 64-COLUMN, ingest-ready CSV - the same shape
 #       used elsewhere in the pipeline (process_newspapers.py):
 #
@@ -65,10 +94,12 @@
 #       If an issue has TIFFs but no matching Town List entry, its
 #       subject / geographic_subject are simply left blank - the issue
 #       still gets a full row (so nothing is silently dropped from the
-#       ingest file), but the errors CSV will flag it so you know to
+#       ingest file), but the merge report will flag it so you know to
 #       track down the missing town data.
 #
-#   <base_name>_errors.csv
+#   Ingest_merge_report_<timestamp>.txt   (written only on a "noteworthy"
+#   run - see merge_and_write_records() - into MergeReports/, not next
+#   to every input)
 #       Every mismatch we found, so you can go fix the source data:
 #           missing_tiffs       -> the Town List has a paper number that
 #                                  doesn't have any matching TIFF files
@@ -79,23 +110,26 @@
 #                                  isn't in the Town List (this issue DOES
 #                                  still appear in the metadata CSV, just
 #                                  with blank subject/geographic_subject)
+#           invalid_date        -> a TIFF filename's date didn't parse as
+#                                  a real calendar date; that issue was
+#                                  skipped
+#           unrecognized_filename / unresolved_volume / duplicate_* /
+#           file_read_error ->    see the problem text itself, it's
+#                                  written out in plain English
+#
+#       A running one-line-per-run log (run_log.txt) and the last run's
+#       full problem set (last_problems.txt) are also kept, in the
+#       _Logs subfolder - see LOGS_SUBDIR_NAME below. There is no
+#       separate "_errors.csv" file; problems are only ever recorded in
+#       the report and in _Logs.
 #
 # HOW TO RUN
 # ----------------------------------------------------------------------------
-#   python build_issue_csv.py /path/to/tiff_directory /path/to/TownList.xlsx
+#   python build_issue_csv.py /path/to/root_folder
+#       (default: the four-folder layout described above)
 #
-#   ...or use a listing file instead of a real folder:
-#
-#   python build_issue_csv.py /path/to/tiff_list.csv /path/to/TownList.xlsx
-#
-#   ...and/or a Google Sheets URL instead of a local Town List file:
-#
-#   python build_issue_csv.py /path/to/tiff_directory "https://docs.google.com/spreadsheets/d/XXXXXXXX/edit"
-#
-#   For a Google Sheets URL to work, the sheet's sharing setting must be
-#   at least "Anyone with the link can view" (Share button, top right of
-#   the sheet, then "Change to anyone with the link"). No Google login
-#   or API key is needed - the script just downloads it as a CSV.
+#   ...manual, single-pair mode also still exists, for one-off files
+#   that don't follow the DataWaiting convention - see main() below.
 #
 # DEPENDENCIES
 # ----------------------------------------------------------------------------
@@ -110,6 +144,7 @@ import re
 import io
 import sys
 import csv
+import shutil
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -1449,31 +1484,54 @@ def resolve_town_list_volumes(town_lists, tiff_issues, filename_hint=None):
     return resolved, problems
 
 
-def gather_all_records(directory):
+def gather_all_records(waiting_dir):
     """
     Read EVERY recognized tifflist file and EVERY recognized Town List
-    file in `directory` - regardless of how they're individually named,
-    or whether they line up 1:1 - and combine everything into one pool
-    of issue records, joined by (volume, paper number) rather than by
-    which specific files they happened to come from. This is what lets
-    a single tifflist file spanning multiple volumes (e.g. "tifflist.txt"
-    covering both Vol. XI and Vol. XII) match correctly against a Town
-    List using either the plain "No." format or the "Old Method" format
-    (a per-row filename reference column).
+    file in `waiting_dir` (the DataWaiting folder) - regardless of how
+    they're individually named, or whether they line up 1:1 - and
+    combine everything into one pool of issue records, joined by
+    (volume, paper number) rather than by which specific files they
+    happened to come from. This is what lets a single tifflist file
+    spanning multiple volumes (e.g. "tifflist.txt" covering both Vol.
+    XI and Vol. XII) match correctly against a Town List using either
+    the plain "No." format or the "Old Method" format (a per-row
+    filename reference column).
 
-    Returns (records, problems, tiff_filenames, townlist_filenames).
+    Returns (records, problems, tiff_filenames, townlist_filenames,
+    file_usable_counts). file_usable_counts maps each input filename to
+    how many usable entries it contributed - used afterward to decide
+    whether that file is safe to move into DataFilesCompleted (see
+    move_processed_input_files()): a file that contributed nothing at
+    all (0) is left in DataWaiting instead, as a visible sign it still
+    needs attention.
     """
-    tiff_filenames = find_tiff_source_files(directory)
-    townlist_filenames = find_town_list_source_files(directory)
+    tiff_filenames = find_tiff_source_files(waiting_dir)
+    townlist_filenames = find_town_list_source_files(waiting_dir)
 
     all_problems = []
+    file_usable_counts = {}
 
     # ---- Read every tifflist file into one combined pool ---------------
     all_tiff_issues = {}
     for filename in tiff_filenames:
-        path = os.path.join(directory, filename)
+        path = os.path.join(waiting_dir, filename)
         print(f"Reading tifflist: {filename}")
-        issues, unrecognized = read_tiff_list_file(path)
+        try:
+            issues, unrecognized = read_tiff_list_file(path)
+        except (UnicodeDecodeError, OSError) as e:
+            # A whole-file read failure - not the same as an individual
+            # unrecognized line. Flag it and leave the file where it is
+            # (file_usable_counts stays at 0 for it, see
+            # move_processed_input_files) rather than letting one bad
+            # file crash the entire run.
+            all_problems.append(
+                f"[{filename}] [file_read_error] Couldn't read this file "
+                f"({e}) - left in DataWaiting for review."
+            )
+            file_usable_counts[filename] = 0
+            continue
+
+        file_usable_counts[filename] = len(issues)
 
         for key, issue in issues.items():
             if key in all_tiff_issues:
@@ -1494,14 +1552,27 @@ def gather_all_records(directory):
     # ---- Read every Town List file into one combined pool ---------------
     all_town_lists = {}
     for filename in townlist_filenames:
-        path = os.path.join(directory, filename)
+        path = os.path.join(waiting_dir, filename)
         print(f"Reading Town List: {filename}")
-        grid = read_grid(path)
-        raw_town_list = parse_town_list(grid)
-        resolved, resolve_problems = resolve_town_list_volumes(
-            raw_town_list, all_tiff_issues, filename_hint=filename
-        )
+        try:
+            grid = read_grid(path)
+            raw_town_list = parse_town_list(grid)
+            resolved, resolve_problems = resolve_town_list_volumes(
+                raw_town_list, all_tiff_issues, filename_hint=filename
+            )
+        except (ValueError, OSError, UnicodeDecodeError) as e:
+            # Same whole-file-failure handling as the tifflist branch
+            # above - e.g. a Town List with no recognizable paper-number
+            # column at all.
+            all_problems.append(
+                f"[{filename}] [file_read_error] Couldn't read this file "
+                f"({e}) - left in DataWaiting for review."
+            )
+            file_usable_counts[filename] = 0
+            continue
+
         all_problems.extend(f"[{filename}] {p}" for p in resolve_problems)
+        file_usable_counts[filename] = len(resolved)
 
         for key, towns in resolved.items():
             if key in all_town_lists:
@@ -1522,7 +1593,7 @@ def gather_all_records(directory):
     )
     all_problems.extend(join_problems)
 
-    return records, all_problems, tiff_filenames, townlist_filenames
+    return records, all_problems, tiff_filenames, townlist_filenames, file_usable_counts
 
 
 # =============================================================================
@@ -1713,6 +1784,65 @@ LOGS_SUBDIR_NAME = "_Logs"
 RUN_LOG_FILENAME = "run_log.txt"
 LAST_PROBLEMS_FILENAME = "last_problems.txt"
 
+# The four-folder layout (see the module header comment for what each
+# one is for). All four live directly under the root directory this
+# script is pointed at, alongside _Logs and (optionally) Archive.
+DATA_WAITING_SUBDIR = "DataWaiting"
+DATA_COMPLETED_SUBDIR = "DataFilesCompleted"
+INGEST_FILES_SUBDIR = "IngestFiles"
+MERGE_REPORTS_SUBDIR = "MergeReports"
+
+
+def ensure_subdir(directory, name):
+    """Creates <directory>/<name> if it doesn't already exist, and
+    returns its path - same pattern as logs_dir_path() below, just
+    generalized to the other three managed subfolders."""
+    path = os.path.join(directory, name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def move_processed_input_files(waiting_dir, completed_dir, filenames,
+                                file_usable_counts, log_root):
+    """
+    After a successful run, move every input file that contributed at
+    least one usable record from DataWaiting into DataFilesCompleted.
+
+    A file that contributed NOTHING (file_usable_counts is 0 or missing
+    for it - meaning every line/row in it failed to parse, or it
+    couldn't be read at all) is left in DataWaiting untouched, so it
+    stays visible as something that still needs a look. The problems it
+    caused are already permanently recorded in the merge report and in
+    _Logs either way, so nothing is lost by leaving it in place.
+    """
+    for filename in filenames:
+        if file_usable_counts.get(filename, 0) <= 0:
+            continue  # whole-file failure - leave it in DataWaiting
+
+        src = os.path.join(waiting_dir, filename)
+        if not os.path.isfile(src):
+            continue  # already gone somehow - don't error out over it
+
+        dest_name = filename
+        dest = os.path.join(completed_dir, dest_name)
+        if os.path.exists(dest):
+            # Shouldn't normally happen (a file is moved out of
+            # DataWaiting as soon as it's processed), but never overwrite
+            # or silently lose something if it does.
+            base, ext = os.path.splitext(filename)
+            counter = 2
+            while os.path.exists(dest):
+                dest_name = f"{base}_dup{counter}{ext}"
+                dest = os.path.join(completed_dir, dest_name)
+                counter += 1
+
+        shutil.move(src, dest)
+        append_run_log(
+            log_root,
+            f"moved '{filename}' to {DATA_COMPLETED_SUBDIR}/{dest_name} "
+            f"after processing"
+        )
+
 
 def logs_dir_path(directory):
     """
@@ -1769,23 +1899,34 @@ def write_last_problems(directory, problems):
             f.write(p + "\n")
 
 
-def merge_and_write_records(directory, all_records, volume_problems, source_line):
+def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
+                             volume_problems, source_line):
     """
     The shared merge/dedup/write engine, used by BOTH the default
     directory-scanning mode and manual single-pair mode. See the module
     comment above run_by_year() for the merge rules and file-naming
     convention.
 
-    directory        - where existing "start-end-ingest.csv" files live,
-                        and where new/updated ones get written
+    log_root         - the root folder _Logs lives under (run_log.txt,
+                        last_problems.txt) - unaffected by the
+                        four-folder split, since _Logs stays at the root
+    ingest_dir        - where existing "start-end-ingest.csv" files live,
+                        and where new/updated ones (+ matching .xlsx)
+                        get written (IngestFiles/ in the default mode)
+    reports_dir       - where Ingest_merge_report_<timestamp>.txt gets
+                        written (MergeReports/ in the default mode)
     all_records      - every issue record to merge in (from
                         compute_issue_record, with "source_volume" set)
     volume_problems  - problem description strings (missing_tiffs etc.)
     source_line       - one line of text for the report describing where
                         all_records came from
+
+    In manual single-pair mode, log_root, ingest_dir, and reports_dir
+    are all the same folder - see main() - preserving that mode's
+    original flat, single-folder behavior.
     """
     # ---- Load whatever ingest files already exist -----------------------
-    existing_files = find_ingest_files(directory)
+    existing_files = find_ingest_files(ingest_dir)
     existing_by_id = {}
     for info in existing_files:
         for row in info["rows"]:
@@ -1882,8 +2023,8 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
                 final_path = active_file["path"]
                 if (new_start, new_end) != (active_file["start_year"], active_file["end_year"]):
                     taken_names.discard(active_file["filename"])
-                    new_filename = make_ingest_filename(directory, new_start, new_end, taken_names)
-                    new_path = os.path.join(directory, new_filename)
+                    new_filename = make_ingest_filename(ingest_dir, new_start, new_end, taken_names)
+                    new_path = os.path.join(ingest_dir, new_filename)
                     os.rename(active_file["path"], new_path)
                     final_path = new_path
                     taken_names.add(new_filename)
@@ -1901,8 +2042,8 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
 
                 start_year = min(r["year"] for r in chunk)
                 end_year = max(r["year"] for r in chunk)
-                filename = make_ingest_filename(directory, start_year, end_year, taken_names)
-                path = os.path.join(directory, filename)
+                filename = make_ingest_filename(ingest_dir, start_year, end_year, taken_names)
+                path = os.path.join(ingest_dir, filename)
 
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=COLUMNS)
@@ -1930,18 +2071,20 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
     # since. This matters a lot now that this runs 5x a day rather than
     # on-demand - most runs genuinely have nothing new to say.
     current_problems = set(volume_problems)
-    problems_changed = current_problems != read_last_problems(directory)
+    problems_changed = current_problems != read_last_problems(log_root)
     noteworthy = bool(added_total) or bool(mismatch_lines) or problems_changed
 
     report_path = None
     if noteworthy:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = os.path.join(directory, f"Ingest_merge_report_{timestamp}.txt")
+        report_path = os.path.join(reports_dir, f"Ingest_merge_report_{timestamp}.txt")
 
         lines = [
             "Ingest merge report",
             f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Directory: {directory}",
+            f"Root directory: {log_root}",
+            f"Input files read from: {DATA_WAITING_SUBDIR}/",
+            f"Ingest files written to: {ingest_dir}",
             source_line,
             "",
             f"New issues added: {added_total} ({new_pages_total} pages)",
@@ -1982,16 +2125,16 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
     # The problem set is saved every run regardless of whether a report
     # got written, so the NEXT run has something current to compare
     # against.
-    write_last_problems(directory, current_problems)
+    write_last_problems(log_root, current_problems)
 
     summary = (
         f"new={added_total} matched={matched_count} "
         f"differing={len(mismatch_lines)} problems={len(current_problems)}"
     )
     if report_path:
-        append_run_log(directory, f"{summary} -> {os.path.basename(report_path)}")
+        append_run_log(log_root, f"{summary} -> {os.path.basename(report_path)}")
     else:
-        append_run_log(directory, f"{summary} -> nothing new since last run, no report written")
+        append_run_log(log_root, f"{summary} -> nothing new since last run, no report written")
 
     print()
     print("Done!")
@@ -2020,12 +2163,21 @@ def merge_and_write_records(directory, all_records, volume_problems, source_line
 def run_by_year(directory):
     """
     The default directory-scanning mode: read every tifflist and Town
-    List file found anywhere in `directory` and merge them all in - no
-    filename pairing required. See the module comment above for the
-    merge/dedup rules and file-naming convention.
+    List file found in DataWaiting/ (a subfolder of `directory`) and
+    merge them all in - no filename pairing required. See the module
+    header comment for the full four-folder layout, and the comment
+    above merge_and_write_records() for the merge/dedup rules and
+    file-naming convention.
     """
-    print(f"Scanning {directory} for tifflist and Town List files...")
-    all_records, problems, tiff_filenames, townlist_filenames = gather_all_records(directory)
+    waiting_dir = ensure_subdir(directory, DATA_WAITING_SUBDIR)
+    completed_dir = ensure_subdir(directory, DATA_COMPLETED_SUBDIR)
+    ingest_dir = ensure_subdir(directory, INGEST_FILES_SUBDIR)
+    reports_dir = ensure_subdir(directory, MERGE_REPORTS_SUBDIR)
+
+    print(f"Scanning {waiting_dir} for tifflist and Town List files...")
+    all_records, problems, tiff_filenames, townlist_filenames, file_usable_counts = (
+        gather_all_records(waiting_dir)
+    )
 
     if not tiff_filenames and not townlist_filenames:
         print("No tifflist or Town List files found.")
@@ -2040,7 +2192,17 @@ def run_by_year(directory):
         f"Tifflist files read: {', '.join(tiff_filenames) or '(none)'}\n"
         f"Town List files read: {', '.join(townlist_filenames) or '(none)'}"
     )
-    merge_and_write_records(directory, all_records, problems, source_line)
+    merge_and_write_records(directory, ingest_dir, reports_dir, all_records,
+                             problems, source_line)
+
+    # Move every input file that contributed at least one usable record
+    # out of DataWaiting into DataFilesCompleted - see
+    # move_processed_input_files() for the "whole-file failure" rule
+    # that keeps a file in DataWaiting instead.
+    move_processed_input_files(
+        waiting_dir, completed_dir, tiff_filenames + townlist_filenames,
+        file_usable_counts, directory,
+    )
 
 
 # =============================================================================
@@ -2136,7 +2298,11 @@ def main():
     )
     problems.extend(f"[{townlist_file}] {p}" for p in resolve_problems)
     source_line = f"Source: {tiff_source} + {townlist_file}"
-    merge_and_write_records(output_dir, records, problems, source_line)
+    # Manual mode has no DataWaiting/IngestFiles/MergeReports split -
+    # everything reads from and writes back to output_dir, same as
+    # before the four-folder layout existed.
+    merge_and_write_records(output_dir, output_dir, output_dir, records,
+                             problems, source_line)
 
 
 if __name__ == "__main__":

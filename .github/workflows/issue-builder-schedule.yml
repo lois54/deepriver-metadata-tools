@@ -1,13 +1,25 @@
 # =============================================================================
 # ISSUE BUILDER SCHEDULE
 # =============================================================================
-# Generated: 2026-07-31 09:10 AM EDT
+# Generated: 2026-08-26 10:20 AM EDT
 #
-# Runs run_from_drive.py on a schedule, which downloads the working
-# folder from Google Drive, runs build_issue_csv.py against it locally
-# on the runner, and uploads back whatever's new or changed.
+# Runs run_from_drive.py on a schedule. That script:
+#   1. downloads the five managed subfolders (DataWaiting,
+#      DataFilesCompleted, IngestFiles, MergeReports, _Logs) from the
+#      Google Drive working folder into a local temp folder on the
+#      runner,
+#   2. runs check_duplicates.py against DataWaiting (fixing any file
+#      with duplicate entries within itself), then build_issue_csv.py
+#      against the whole local folder (same as it would run against a
+#      real folder on a Mac),
+#   3. uploads back whatever's new, changed, or moved.
 #
-# WHY THIS FILE HAS A NEW NAME
+# See run_from_drive.py's own header for the full explanation, and
+# build_issue_csv.py's header for what the four managed subfolders are
+# for. Archive/ and Patrick's "On Deck!" folder are left alone by all
+# of this - they're not part of the managed subfolder set.
+#
+# WHY THIS FILE HAS THIS NAME
 # ----------------------------------------------------------------------------
 # This replaces .github/workflows/run-issue-builder.yml, which was
 # deleted. That file's SCHEDULED trigger stopped firing reliably after
@@ -23,7 +35,7 @@
 # GitHub to treat this as a brand-new workflow (a new internal workflow
 # ID), rather than an update to whatever was stuck - the standard fix
 # for this category of problem. If scheduled runs still don't fire
-# reliably under this new file after a reasonable observation window,
+# reliably under this file after a reasonable observation window,
 # that's strong evidence the problem isn't fixable from the repo side,
 # and is worth a real GitHub Support ticket (not the AI chat) with the
 # full history attached.
@@ -45,7 +57,8 @@
 # ----------------------------------------------------------------------------
 # This workflow can also be triggered by hand from the Actions tab on
 # GitHub (Actions -> Issue Builder Schedule -> Run workflow), without
-# waiting for the schedule - useful for testing changes.
+# waiting for the schedule - useful for testing changes, or for an
+# off-schedule run any time.
 # =============================================================================
 
 name: Issue Builder Schedule
@@ -62,7 +75,7 @@ permissions:
 jobs:
   run-issue-builder:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repo
