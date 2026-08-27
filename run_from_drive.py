@@ -21,11 +21,22 @@
 #                  itself knows or needs to know it's not on a Drive-
 #                  synced folder - see their own headers for what each
 #                  one does.
-#   3. UPLOAD    - look at what's new, changed, or GONE in each local
+#   3. RECONCILE - for a file that vanished from DataWaiting locally
+#                  because it was successfully processed and moved to
+#                  DataFilesCompleted under the same name, move the
+#                  SAME Drive file into DataFilesCompleted (changing
+#                  its folder) rather than deleting the original and
+#                  uploading a fresh copy. This preserves the file's
+#                  original owner and Drive history, and - importantly
+#                  - doesn't require any delete permission on a file a
+#                  contributor uploaded themselves, since moving a
+#                  shared file between folders is an ordinary edit.
+#   4. UPLOAD    - look at what's new or changed in each local
 #                  subfolder after the run, and push just those changes
-#                  back up to Drive - including deleting a Drive file
-#                  from DataWaiting if it was moved out locally (into
-#                  DataFilesCompleted) rather than just edited in place.
+#                  back up to Drive. A file that still needs removing
+#                  from DataWaiting after step 3 (rare - see
+#                  reconcile_moved_files()) falls back to a real
+#                  delete, but that's now the exception, not the rule.
 #
 # This script is the ONLY part that knows about Google Drive. All of the
 # actual metadata logic, and all of the folder-layout logic (what goes
@@ -76,6 +87,7 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.auth.transport.requests import Request as OAuthRequest
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -291,15 +303,108 @@ def update_existing_file(service, file_id, local_path, name):
     print(f"  uploaded (updated): {name}")
 
 
+def move_file_between_folders(service, file_id, name, source_folder_id, dest_folder_id):
+    """
+    Moves a Drive file from one folder to another by changing which
+    folder(s) it's filed under (Drive's "parents" field) - NOT by
+    deleting the original and uploading a fresh copy. This is the
+    correct, Drive-native way to move a file, and deliberately used
+    instead of trash_file() + upload_new_file() for the common case of
+    a file build_issue_csv.py successfully processed and moved from
+    DataWaiting into DataFilesCompleted under the same name.
+
+    This matters specifically for files someone else owns (the normal
+    case here - contributors drop their own files into DataWaiting):
+    changing a file's folder is an ordinary EDIT, which an Editor has
+    on anything shared with them, regardless of ownership. Trashing a
+    file is a separate, more restrictive permission Drive can withhold
+    independently of edit access - see trash_file() below, which is
+    kept only as a fallback for the rare case this can't be used.
+
+    Returns True on success, False if Drive refused the request (kept
+    non-fatal, same as trash_file() - a permissions surprise here
+    should never cost you the rest of a successful run's upload).
+    """
+    try:
+        service.files().update(
+            fileId=file_id,
+            addParents=dest_folder_id,
+            removeParents=source_folder_id,
+            fields="id, parents",
+        ).execute()
+    except HttpError as e:
+        print(f"  WARNING: couldn't move '{name}' to its new folder on Drive "
+              f"({e}). Leaving it where it was for now - you may need to "
+              f"move it by hand.")
+        return False
+    print(f"  moved on Drive: {name}")
+    return True
+
+
+def reconcile_moved_files(service, waiting_folder_id, waiting_dir, waiting_name_to_id,
+                           completed_folder_id, completed_dir, completed_name_to_id):
+    """
+    Finds every file that was downloaded from DataWaiting but no longer
+    exists there locally, and - for the common case where a file of the
+    SAME name has appeared in DataFilesCompleted (build_issue_csv.py's
+    normal "processed successfully" move) - performs a real Drive move
+    (see move_file_between_folders) rather than a delete+recreate, so
+    the file's original owner and Drive history are preserved and no
+    delete permission is ever needed for this, the everyday case.
+
+    On success, updates completed_name_to_id (so the later upload pass
+    for DataFilesCompleted treats it as an existing file, not a fresh
+    one to create) and removes the entry from waiting_name_to_id (so
+    the later upload pass for DataWaiting doesn't also try to trash a
+    file that's already been moved). If a file vanished from
+    DataWaiting with no same-named match in DataFilesCompleted (a rarer
+    case - e.g. check_duplicates.py's tagged/renamed original), or if
+    the move itself fails, this leaves name_to_id untouched, and the
+    existing trash-based fallback in upload_subfolder_changes handles
+    it exactly as before - safely, just with a warning if that also
+    hits a permissions wall.
+    """
+    current_waiting_names = {
+        f for f in os.listdir(waiting_dir)
+        if f not in IGNORED_NAMES and os.path.isfile(os.path.join(waiting_dir, f))
+    }
+    vanished_names = [n for n in waiting_name_to_id if n not in current_waiting_names]
+
+    for name in sorted(vanished_names):
+        if not os.path.isfile(os.path.join(completed_dir, name)):
+            continue  # no same-named match in DataFilesCompleted - leave to the trash fallback
+
+        moved = move_file_between_folders(
+            service, waiting_name_to_id[name], name, waiting_folder_id, completed_folder_id
+        )
+        if moved:
+            completed_name_to_id[name] = waiting_name_to_id[name]
+            del waiting_name_to_id[name]
+
+
 def trash_file(service, file_id, name):
     """
-    Moves a Drive file to the trash - used only for DataWaiting, when a
-    file that was downloaded from there no longer exists locally
-    afterward, because build_issue_csv.py or check_duplicates.py MOVED
-    it into DataFilesCompleted rather than just editing it in place.
+    Moves a Drive file to the trash - the fallback for a file that
+    vanished from DataWaiting locally but has no same-named match in
+    DataFilesCompleted for reconcile_moved_files() above to reuse (so
+    there's nothing sensible to "move" it into), or for the rare case
+    a real move itself fails.
+
+    Returns True on success, False if Drive refused the request (e.g. a
+    permissions error - see the try/except in upload_subfolder_changes,
+    which treats a failed trash as a warning rather than a fatal error).
     """
-    service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    try:
+        service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    except HttpError as e:
+        print(f"  WARNING: couldn't remove '{name}' from Drive automatically "
+              f"({e}). It was already correctly handled locally - you'll "
+              f"just see this file left behind in DataWaiting too, and may "
+              f"need to delete it there by hand. Check who owns this file "
+              f"in Drive (right-click -> Details) if this keeps happening.")
+        return False
     print(f"  removed from Drive (moved locally): {name}")
+    return True
 
 
 def download_subfolder(service, oauth_service, parent_folder_id, name, work_dir):
@@ -429,10 +534,31 @@ def main():
               "be uploaded back to Drive, so nothing partial gets pushed up.")
         sys.exit(result.returncode)
 
-    # ---- Step 3: UPLOAD every managed subfolder's changes ----
+    # ---- Step 3: reconcile files MOVED between DataWaiting and
+    # DataFilesCompleted using a real Drive move, before the general
+    # upload pass - see reconcile_moved_files() for why this matters
+    # for files owned by someone other than this script's credentials.
+    waiting_folder_id, waiting_dir, waiting_name_to_id = subfolder_info["DataWaiting"]
+    completed_folder_id, completed_dir, completed_name_to_id = subfolder_info["DataFilesCompleted"]
+    reconcile_moved_files(
+        service, waiting_folder_id, waiting_dir, waiting_name_to_id,
+        completed_folder_id, completed_dir, completed_name_to_id,
+    )
+
+    # ---- Step 4: UPLOAD every managed subfolder's remaining changes ----
+    # DataWaiting is synced LAST, deliberately - it's the only folder
+    # where a deletion happens (see SUBFOLDER_HANDLES_DELETIONS), and a
+    # deletion is inherently riskier than a plain upload (e.g. a Drive
+    # permissions error on one file - see trash_file()). Syncing the
+    # other four folders first means the actual valuable output of the
+    # run (the new/updated ingest CSV, the report, the completed-file
+    # moves, the log) is safely on Drive BEFORE anything involving a
+    # deletion is even attempted - so a problem with DataWaiting's
+    # cleanup can never cost you a correctly-computed run's output.
     print("Checking for new, changed, or moved files to sync back to Drive...")
+    upload_order = [n for n in SUBFOLDERS if n != "DataWaiting"] + ["DataWaiting"]
     total_uploaded = 0
-    for name in SUBFOLDERS:
+    for name in upload_order:
         drive_folder_id, local_dir, name_to_id = subfolder_info[name]
         total_uploaded += upload_subfolder_changes(
             service, oauth_service, drive_folder_id, local_dir, name_to_id,
