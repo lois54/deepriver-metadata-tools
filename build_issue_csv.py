@@ -1498,18 +1498,30 @@ def gather_all_records(waiting_dir):
     filename reference column).
 
     Returns (records, problems, tiff_filenames, townlist_filenames,
-    file_usable_counts). file_usable_counts maps each input filename to
-    how many usable entries it contributed - used afterward to decide
-    whether that file is safe to move into DataFilesCompleted (see
-    move_processed_input_files()): a file that contributed nothing at
-    all (0) is left in DataWaiting instead, as a visible sign it still
-    needs attention.
+    file_usable_counts, file_pending). file_usable_counts maps each
+    input filename to how many entries it contributed that were
+    successfully parsed (used, together with file_pending, to decide
+    whether a file is safe to move into DataFilesCompleted - see
+    move_processed_input_files()). file_pending is the set of filenames
+    that still have at least one entry NOT yet written to the ingest
+    file - waiting on a matching tifflist or Town List entry that
+    hasn't shown up yet (or, for a tifflist, an invalid date that needs
+    a manual fix) - so the file stays visible in DataWaiting and gets
+    automatically retried on a future run instead of being moved away
+    and having that data effectively lost.
     """
     tiff_filenames = find_tiff_source_files(waiting_dir)
     townlist_filenames = find_town_list_source_files(waiting_dir)
 
     all_problems = []
     file_usable_counts = {}
+
+    # key -> filename that supplied it (first-seen file only, matching
+    # the "keep the first one seen" cross-file duplicate rule below) -
+    # lets a key that ends up unmatched be traced back to the specific
+    # input file that should stay in DataWaiting because of it.
+    tiff_key_source = {}
+    town_key_source = {}
 
     # ---- Read every tifflist file into one combined pool ---------------
     all_tiff_issues = {}
@@ -1542,6 +1554,7 @@ def gather_all_records(waiting_dir):
                 )
                 continue
             all_tiff_issues[key] = issue
+            tiff_key_source[key] = filename
 
         for item in unrecognized:
             all_problems.append(
@@ -1583,17 +1596,26 @@ def gather_all_records(waiting_dir):
                 )
                 continue
             all_town_lists[key] = towns
+            town_key_source[key] = filename
 
     source_label = (
         f"{len(tiff_filenames)} tifflist file(s)" if tiff_filenames
         else "no tifflist files found"
     )
-    records, join_problems = records_from_single_source(
+    records, join_problems, pending_tiff_keys, pending_town_keys = records_from_single_source(
         all_tiff_issues, all_town_lists, [], source_label=source_label,
     )
     all_problems.extend(join_problems)
 
-    return records, all_problems, tiff_filenames, townlist_filenames, file_usable_counts
+    file_pending = set()
+    for key in pending_tiff_keys:
+        if key in tiff_key_source:
+            file_pending.add(tiff_key_source[key])
+    for key in pending_town_keys:
+        if key in town_key_source:
+            file_pending.add(town_key_source[key])
+
+    return records, all_problems, tiff_filenames, townlist_filenames, file_usable_counts, file_pending
 
 
 # =============================================================================
@@ -1723,12 +1745,30 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     scan_tiff_directory / read_tiff_list_file and
     resolve_town_list_volumes.
 
+    An issue only gets written into the ingest file if it has BOTH a
+    tiff match AND a Town List match. Neither missing_tiffs nor
+    missing_town_list produces a record - a page/issue is never entered
+    with blank or absent town data. This matters for the async
+    contributor workflow this project runs on: a tifflist or Town List
+    file can arrive in DataWaiting before its counterpart is ready, and
+    an issue that isn't complete yet should simply wait to be retried
+    on a later run, not get written with a gap.
+
     problem_prefix is prepended to every problem line (e.g. "[Vol_09] ")
     so problems from multiple sources can be told apart in one report;
     leave it blank when there's only a single source.
+
+    Returns (records, problems, pending_tiff_keys, pending_town_keys).
+    pending_tiff_keys / pending_town_keys are the (volume, paper_no)
+    keys that didn't make it into a record, split by which SIDE still
+    needs attention - used by gather_all_records() to figure out which
+    specific input file(s) should stay in DataWaiting rather than move
+    to DataFilesCompleted, since their data isn't fully used yet.
     """
     records = []
     problems = []
+    pending_tiff_keys = set()
+    pending_town_keys = set()
 
     town_keys = set(town_lists.keys())
     tiff_keys = set(tiff_issues.keys())
@@ -1741,8 +1781,11 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
             f"{problem_prefix}[missing_tiffs] Town List has Vol_{volume} "
             f"paper #{paper_no} with towns "
             f"({MULTI_SEP.join(town_lists[key])}), but no matching TIFF "
-            f"was found in {source_label}."
+            f"has been found in {source_label} yet - not added to the "
+            f"ingest file; will be picked up automatically once a "
+            f"matching TIFF shows up."
         )
+        pending_town_keys.add(key)
 
     for item in unrecognized_items:
         problems.append(
@@ -1767,17 +1810,23 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
                 f"has an invalid date ('{issue['date']}') and was skipped - "
                 f"check the source TIFF filename(s) for a typo."
             )
+            pending_tiff_keys.add(key)
             continue
-        record["source_volume"] = f"Vol_{key[0]}"
+
         if key in only_in_tiffs:
             problems.append(
                 f"{problem_prefix}[missing_town_list] Issue "
-                f"{record['issue_id']} has no Town List entry - included "
-                f"with blank subject/geographic_subject."
+                f"{record['issue_id']} has no Town List entry yet - not "
+                f"added to the ingest file; will be picked up "
+                f"automatically once a matching Town List entry shows up."
             )
+            pending_tiff_keys.add(key)
+            continue
+
+        record["source_volume"] = f"Vol_{key[0]}"
         records.append(record)
 
-    return records, problems
+    return records, problems, pending_tiff_keys, pending_town_keys
 
 
 LOGS_SUBDIR_NAME = "_Logs"
@@ -1803,21 +1852,35 @@ def ensure_subdir(directory, name):
 
 
 def move_processed_input_files(waiting_dir, completed_dir, filenames,
-                                file_usable_counts, log_root):
+                                file_usable_counts, file_pending, log_root):
     """
-    After a successful run, move every input file that contributed at
-    least one usable record from DataWaiting into DataFilesCompleted.
+    After a successful run, move every input file that (a) contributed
+    at least one usable record and (b) has NOTHING still pending, from
+    DataWaiting into DataFilesCompleted.
 
     A file that contributed NOTHING (file_usable_counts is 0 or missing
     for it - meaning every line/row in it failed to parse, or it
     couldn't be read at all) is left in DataWaiting untouched, so it
-    stays visible as something that still needs a look. The problems it
-    caused are already permanently recorded in the merge report and in
-    _Logs either way, so nothing is lost by leaving it in place.
+    stays visible as something that still needs a look.
+
+    A file with at least one entry still in file_pending - waiting on a
+    matching tifflist or Town List entry that hasn't shown up yet, or
+    (for a tifflist) an invalid date needing a manual fix - is ALSO left
+    in DataWaiting, even if some of its other entries matched fine and
+    were already written to the ingest file this run. This is what lets
+    the async contributor workflow actually work: a tifflist can arrive
+    before its Town List, or vice versa, and the file holding the
+    not-yet-matched data stays available to be retried automatically on
+    a later run instead of being moved away and having that data
+    effectively lost. The problems are already permanently recorded in
+    the merge report and in _Logs either way, so nothing is lost by
+    leaving the file in place.
     """
     for filename in filenames:
         if file_usable_counts.get(filename, 0) <= 0:
             continue  # whole-file failure - leave it in DataWaiting
+        if filename in file_pending:
+            continue  # still has unmatched entries - leave it in DataWaiting
 
         src = os.path.join(waiting_dir, filename)
         if not os.path.isfile(src):
@@ -2175,7 +2238,7 @@ def run_by_year(directory):
     reports_dir = ensure_subdir(directory, MERGE_REPORTS_SUBDIR)
 
     print(f"Scanning {waiting_dir} for tifflist and Town List files...")
-    all_records, problems, tiff_filenames, townlist_filenames, file_usable_counts = (
+    all_records, problems, tiff_filenames, townlist_filenames, file_usable_counts, file_pending = (
         gather_all_records(waiting_dir)
     )
 
@@ -2196,12 +2259,13 @@ def run_by_year(directory):
                              problems, source_line)
 
     # Move every input file that contributed at least one usable record
-    # out of DataWaiting into DataFilesCompleted - see
-    # move_processed_input_files() for the "whole-file failure" rule
-    # that keeps a file in DataWaiting instead.
+    # AND has nothing still pending a match out of DataWaiting into
+    # DataFilesCompleted - see move_processed_input_files() for the
+    # "whole-file failure" and "still pending" rules that keep a file
+    # in DataWaiting instead.
     move_processed_input_files(
         waiting_dir, completed_dir, tiff_filenames + townlist_filenames,
-        file_usable_counts, directory,
+        file_usable_counts, file_pending, directory,
     )
 
 
@@ -2293,7 +2357,7 @@ def main():
     print(f"  Found {len(town_lists)} issue(s) in the Town List.")
 
     print("Merging into output files...")
-    records, problems = records_from_single_source(
+    records, problems, _pending_tiff, _pending_town = records_from_single_source(
         tiff_issues, town_lists, unrecognized_items, source_label=source_label,
     )
     problems.extend(f"[{townlist_file}] {p}" for p in resolve_problems)
