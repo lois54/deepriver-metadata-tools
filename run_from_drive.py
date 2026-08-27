@@ -435,11 +435,23 @@ def upload_subfolder_changes(service, oauth_service, drive_folder_id, local_dir,
                               name_to_id, run_started_at, handle_deletions=False):
     """
     Uploads every new/changed file in local_dir back to the matching
-    Drive folder (same "new since before the run" mtime check as
-    before). If handle_deletions is True, also trashes any Drive file
-    whose name was originally downloaded from this folder but no longer
-    exists locally afterward - see trash_file() above. Returns the
-    number of files uploaded (not counting deletions).
+    Drive folder. If handle_deletions is True, also trashes any Drive
+    file whose name was originally downloaded from this folder but no
+    longer exists locally afterward - see trash_file() above. Returns
+    the number of files uploaded (not counting deletions).
+
+    A file NOT already in name_to_id (Drive has nothing under this name
+    in this folder) is ALWAYS uploaded, regardless of its local mtime.
+    This matters specifically for a file that arrived here via
+    os.rename()/shutil.move() rather than being freshly written -
+    check_duplicates.py's tag-and-move for a duplicate-flagged original,
+    for instance. A pure filesystem rename/move does NOT update a
+    file's modification time; it keeps the mtime from whenever its
+    content was first written, which for a file that started out
+    downloaded from Drive is from BEFORE this run even began. So mtime
+    can only be trusted to answer "did an already-known file change" -
+    for anything Drive doesn't have yet under this name, upload it
+    unconditionally.
     """
     uploaded_count = 0
     current_names = set()
@@ -452,15 +464,16 @@ def upload_subfolder_changes(service, oauth_service, drive_folder_id, local_dir,
             continue
         current_names.add(filename)
 
-        mtime = os.path.getmtime(local_path)
-        if mtime < run_started_at:
-            # Unchanged since before the run - one of the original
-            # downloaded inputs that nothing touched.
-            continue
-
         if filename in name_to_id:
+            mtime = os.path.getmtime(local_path)
+            if mtime < run_started_at:
+                # Unchanged since before the run - one of the original
+                # downloaded inputs that nothing touched.
+                continue
             update_existing_file(service, name_to_id[filename], local_path, filename)
         else:
+            # Nothing Drive has under this name in this folder yet -
+            # always upload, mtime notwithstanding (see docstring).
             upload_new_file(oauth_service, drive_folder_id, local_path, filename)
         uploaded_count += 1
 
