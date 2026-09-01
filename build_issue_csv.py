@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-08-26 10:20 AM EDT
+# Generated: 2026-09-01 09:15 AM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -167,6 +167,9 @@ DESCRIPTION = ("Contact the Deep River Historical Society at "
 MEMBER_OF_EXISTING_ENTITY_ID = 61106
 
 GENRE = "newspapers"
+
+# language field (column W) - every row, same value.
+LANGUAGE = "English"
 
 # persons field (column T) - the publisher's name changes based on the
 # issue's year (see PUBLISHER_BY_DATE below); everything else is fixed.
@@ -1238,6 +1241,7 @@ def build_parent_row_dict(record):
         "description": DESCRIPTION,
         "persons": record["persons"],
         "origin_information": record["origin_information"],
+        "language": LANGUAGE,
         "genre": GENRE,
         "subject": record["subject"],
         "geographic_subject": record["geographic_subject"],
@@ -1282,6 +1286,7 @@ def rows_from_issue_record(record, start_id):
             "media_use": "Original File",
             "digital_origin": "reformatted digital",
             "resource_type": RESOURCE_TYPE,
+            "language": LANGUAGE,
         })
         rows.append(page_row)
 
