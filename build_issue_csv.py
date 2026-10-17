@@ -732,18 +732,34 @@ def parse_format_a_rows(grid):
         Filelist.txt              | No. | Subject 1  | ...
         18850102_vXI_n39.pdf      | 39  | Deep River | ...
 
-    We find whichever column is the paper-number column (its header is
-    something like "No." or "Paper No."), and every column after that is
-    treated as a town name (blank cells are just skipped).
+    or a THIRD variant with no separate paper-number column at all -
+    just a filename/reference column (header containing "file", e.g.
+    "File Name") whose values are full issue filenames like
+    "19030102_vXXIX_n40", with the paper number (and volume) embedded
+    in the name itself rather than broken out into its own column:
 
-    If there's ALSO a column before it whose header looks like a
-    filename reference (contains "file"), each row's volume is read
-    from that filename via parse_issue_prefix() - this matters because
-    paper numbers reset every volume, so a Town List spanning more than
-    one volume (like the "Old Method" example above, which covers both
-    Vol. XI and Vol. XII) needs a per-row volume to avoid collisions.
-    Otherwise every row's volume is left as None, to be resolved later
-    from context (see resolve_town_list_volumes()).
+        File Name                 | Subject 1  | Subject 2 | ...
+        19030102_vXXIX_n40         | Deep River | Chester   | ...
+
+    We first look for a plain paper-number column (header like "No."
+    or "Paper No."). If one exists, every column after it is a town
+    name (blank cells skipped), same as always, and a reference-
+    filename column before it (if any) supplies each row's volume via
+    parse_issue_prefix() - this matters because paper numbers reset
+    every volume, so a Town List spanning more than one volume (like
+    the "Old Method" example above, which covers both Vol. XI and Vol.
+    XII) needs a per-row volume to avoid collisions.
+
+    If there's no paper-number column, we fall back to the filename
+    column itself: parse_issue_prefix() pulls BOTH the volume and the
+    paper number straight out of each row's filename, and every column
+    after the filename column is then treated as a town name. A row
+    whose filename doesn't parse is skipped (it'll surface later as a
+    missing_town_list problem for that issue, same as any other gap).
+
+    If neither a paper-number column nor a filename column can be
+    found at all, there's no way to tell which issue each row belongs
+    to, and we give up with an error.
 
     Returns dict[(volume_or_None, paper_no)] -> list of town names.
     """
@@ -758,42 +774,74 @@ def parse_format_a_rows(grid):
             paper_no_col = col_index
             break
 
-    if paper_no_col is None:
-        raise ValueError(
-            "Couldn't find a paper-number column (looked for a header "
-            "like 'No.' or 'Paper No.') in this Town List file."
-        )
+    if paper_no_col is not None:
+        # Normal case: a reference-filename column, if present, is only
+        # ever expected BEFORE the paper-number column (the "Old
+        # Method" layout), so we only search there.
+        reference_col = None
+        for col_index in range(paper_no_col):
+            if "file" in header_row[col_index].strip().lower():
+                reference_col = col_index
+                break
+    else:
+        # No paper-number column at all - fall back to a filename
+        # column, searched across the WHOLE header, that will supply
+        # both the volume and the paper number for every row.
+        reference_col = None
+        for col_index, header_text in enumerate(header_row):
+            if "file" in header_text.strip().lower():
+                reference_col = col_index
+                break
 
-    reference_col = None
-    for col_index in range(paper_no_col):
-        if "file" in header_row[col_index].strip().lower():
-            reference_col = col_index
-            break
+        if reference_col is None:
+            raise ValueError(
+                "Couldn't find a paper-number column (looked for a "
+                "header like 'No.' or 'Paper No.') or a filename "
+                "column (looked for a header containing 'File') to "
+                "get the paper number from in this Town List file."
+            )
 
     town_list = {}
 
     # Walk every data row (skip the header row itself).
     for row in grid[1:]:
-        if paper_no_col >= len(row):
-            continue  # row is too short to even have a paper number
-
-        paper_no_text = row[paper_no_col].strip()
-        if not paper_no_text.isdigit():
-            continue  # blank trailing row, or something we can't parse
-
-        paper_no = int(paper_no_text)
-
         volume = None
-        if reference_col is not None and reference_col < len(row):
-            parsed = parse_issue_prefix(row[reference_col])
-            if parsed:
-                volume, _ = parsed
 
-        # Every column AFTER the paper-number column is a potential town.
-        # Blank cells are simply skipped (that's how the padding works).
+        if paper_no_col is not None:
+            if paper_no_col >= len(row):
+                continue  # row is too short to even have a paper number
+
+            paper_no_text = row[paper_no_col].strip()
+            if not paper_no_text.isdigit():
+                continue  # blank trailing row, or something we can't parse
+
+            paper_no = int(paper_no_text)
+
+            if reference_col is not None and reference_col < len(row):
+                parsed = parse_issue_prefix(row[reference_col])
+                if parsed:
+                    volume, _ = parsed
+
+            towns_start_col = paper_no_col + 1
+        else:
+            # Fallback case: the filename column is our only source of
+            # a paper number, and it gives us the volume for free too.
+            if reference_col >= len(row):
+                continue  # row is too short to even have a filename
+
+            parsed = parse_issue_prefix(row[reference_col])
+            if not parsed:
+                continue  # doesn't look like an issue filename - skip
+            volume, paper_no = parsed
+
+            towns_start_col = reference_col + 1
+
+        # Every column AFTER the paper-number (or filename) column is a
+        # potential town. Blank cells are simply skipped (that's how
+        # the padding works).
         towns = [
             cell.strip()
-            for cell in row[paper_no_col + 1:]
+            for cell in row[towns_start_col:]
             if cell.strip()
         ]
 
