@@ -2,7 +2,7 @@
 # =============================================================================
 # RUN FROM DRIVE
 # =============================================================================
-# Generated: 2026-08-26 10:20 AM EDT
+# Generated: 2026-10-17 02:05 PM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -15,6 +15,10 @@
 #                  IngestFiles, MergeReports, _Logs) down into a
 #                  matching local temp folder on the GitHub runner, so
 #                  it looks exactly like the real Drive folder does.
+#                  IngestFiles is organized by build_issue_csv.py into
+#                  one subfolder per calendar year (e.g.
+#                  IngestFiles/1883/) - see NESTED_SUBFOLDERS below,
+#                  synced one level deeper than the other four.
 #   2. RUN       - call check_duplicates.py, then build_issue_csv.py,
 #                  against that local temp folder, exactly the way
 #                  they'd run against a real folder. Neither script
@@ -45,8 +49,9 @@
 #
 # Two folders this script deliberately never touches: Archive/ (manual
 # use only) and Patrick's "On Deck!" folder (his own staging area,
-# unrelated to any of this) - neither is in the SUBFOLDERS list below,
-# so neither is ever listed, downloaded, or uploaded to.
+# unrelated to any of this) - neither is in FLAT_SUBFOLDERS or
+# NESTED_SUBFOLDERS below, so neither is ever listed, downloaded, or
+# uploaded to.
 #
 # WHAT IT NEEDS TO RUN
 # ----------------------------------------------------------------------------
@@ -65,6 +70,14 @@
 #   - OAuth credentials for creating brand-new Drive files/folders (see
 #     the OAUTH_SCOPES comment below): GDRIVE_OAUTH_CLIENT_ID,
 #     GDRIVE_OAUTH_CLIENT_SECRET, GDRIVE_OAUTH_REFRESH_TOKEN.
+#
+#   - EMAIL_APP_PASSWORD, if you want build_issue_csv.py's problem-alert
+#     email to work (see that script's own header/CONFIGURATION for how
+#     to generate one). This script doesn't read it directly - it's
+#     only used by build_issue_csv.py, run as a subprocess below, which
+#     inherits this process's environment automatically. Not setting it
+#     just means that one email step gets silently skipped; everything
+#     else still runs normally.
 #
 # HOW TO RUN IT LOCALLY (for testing before trusting it in GitHub Actions)
 # ----------------------------------------------------------------------------
@@ -110,16 +123,25 @@ OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 # of the actual data, just noise that can show up in a folder listing.
 IGNORED_NAMES = {".DS_Store"}
 
-# The five subfolders this script manages, each synced independently.
-# See build_issue_csv.py's module header for what each one is for.
+# The four FLAT subfolders this script manages, synced independently -
+# each one is a plain folder with no further subfolders expected inside
+# it. See build_issue_csv.py's module header for what each one is for.
 # Archive/ and Patrick's "On Deck!" folder are deliberately NOT in this
 # list - see the module comment above.
-SUBFOLDERS = [
+FLAT_SUBFOLDERS = [
     "DataWaiting",
     "DataFilesCompleted",
-    "IngestFiles",
     "MergeReports",
     "_Logs",
+]
+
+# IngestFiles is NOT flat - build_issue_csv.py now organizes it into one
+# subfolder PER CALENDAR YEAR (e.g. IngestFiles/1883/), so it needs the
+# one-level-deeper sync in sync_nested_subfolder_set() /
+# upload_nested_subfolder_set() below instead of the plain
+# download_subfolder() / upload_subfolder_changes() the flat four use.
+NESTED_SUBFOLDERS = [
+    "IngestFiles",
 ]
 
 # Only DataWaiting needs delete-on-move handling - see
@@ -485,6 +507,93 @@ def upload_subfolder_changes(service, oauth_service, drive_folder_id, local_dir,
     return uploaded_count
 
 
+def sync_nested_subfolder_set(service, oauth_service, parent_folder_id, parent_name, work_dir):
+    """
+    Like download_subfolder(), but for a managed folder that itself
+    contains one further level of subfolders - today, just IngestFiles,
+    which build_issue_csv.py organizes into one subfolder per calendar
+    year (e.g. IngestFiles/1883/). Downloads the parent folder's own
+    direct files (none expected today, but tolerated) AND every child
+    (year) folder's files, each into its own local directory.
+
+    Returns (parent_drive_folder_id, parent_local_dir, name_to_id,
+    child_info) - child_info is {child_name: (child_drive_folder_id,
+    child_local_dir, child_name_to_id)}, fed straight back into
+    upload_nested_subfolder_set() after the run.
+    """
+    parent_drive_folder_id, parent_local_dir, name_to_id = download_subfolder(
+        service, oauth_service, parent_folder_id, parent_name, work_dir
+    )
+
+    # Every Drive SUBfolder directly inside this one - the year folders.
+    query = (
+        f"'{parent_drive_folder_id}' in parents and trashed = false and "
+        f"mimeType = 'application/vnd.google-apps.folder'"
+    )
+    response = service.files().list(
+        q=query, spaces="drive", fields="files(id, name)"
+    ).execute()
+
+    child_info = {}
+    for folder in response.get("files", []):
+        child_name = folder["name"]
+        child_local_dir = os.path.join(parent_local_dir, child_name)
+        os.makedirs(child_local_dir, exist_ok=True)
+
+        files = list_drive_files(service, folder["id"])
+        child_name_to_id = {}
+        for f in files:
+            local_path = os.path.join(child_local_dir, f["name"])
+            download_file(service, f["id"], local_path)
+            child_name_to_id[f["name"]] = f["id"]
+            print(f"  downloaded ({parent_name}/{child_name}): {f['name']}")
+
+        child_info[child_name] = (folder["id"], child_local_dir, child_name_to_id)
+        print(f"  {len(child_name_to_id)} file(s) found in {parent_name}/{child_name}.")
+
+    return parent_drive_folder_id, parent_local_dir, name_to_id, child_info
+
+
+def upload_nested_subfolder_set(service, oauth_service, parent_drive_folder_id,
+                                 parent_local_dir, name_to_id, child_info,
+                                 run_started_at):
+    """
+    Uploads changes for a folder synced with sync_nested_subfolder_set():
+    its own direct files (as a plain upload_subfolder_changes() call),
+    PLUS every child (year) subfolder - the ones already known from
+    child_info, and any BRAND NEW local subfolder build_issue_csv.py
+    created this run (a year that's never had output before), found or
+    created on Drive on the fly via find_or_create_subfolder().
+    """
+    uploaded = upload_subfolder_changes(
+        service, oauth_service, parent_drive_folder_id, parent_local_dir,
+        name_to_id, run_started_at,
+    )
+
+    local_child_names = {
+        d for d in os.listdir(parent_local_dir)
+        if os.path.isdir(os.path.join(parent_local_dir, d))
+    }
+    for child_name in sorted(local_child_names):
+        child_local_dir = os.path.join(parent_local_dir, child_name)
+        if child_name in child_info:
+            child_drive_folder_id, _, child_name_to_id = child_info[child_name]
+        else:
+            # A year folder build_issue_csv.py created fresh this run -
+            # didn't exist on Drive yet.
+            child_drive_folder_id = find_or_create_subfolder(
+                service, oauth_service, parent_drive_folder_id, child_name
+            )
+            child_name_to_id = {}
+
+        uploaded += upload_subfolder_changes(
+            service, oauth_service, child_drive_folder_id, child_local_dir,
+            child_name_to_id, run_started_at,
+        )
+
+    return uploaded
+
+
 def main():
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
     if not folder_id:
@@ -500,13 +609,23 @@ def main():
 
     # ---- Step 1: DOWNLOAD every managed subfolder ----
     subfolder_info = {}  # name -> (drive_folder_id, local_dir, name_to_id)
-    for name in SUBFOLDERS:
+    for name in FLAT_SUBFOLDERS:
         print(f"Syncing {name} ...")
         drive_folder_id, local_dir, name_to_id = download_subfolder(
             service, oauth_service, folder_id, name, work_dir
         )
         subfolder_info[name] = (drive_folder_id, local_dir, name_to_id)
         print(f"  {len(name_to_id)} file(s) found in {name}.")
+
+    nested_info = {}  # name -> (drive_folder_id, local_dir, name_to_id, child_info)
+    for name in NESTED_SUBFOLDERS:
+        print(f"Syncing {name} (and its year subfolders) ...")
+        drive_folder_id, local_dir, name_to_id, child_info = sync_nested_subfolder_set(
+            service, oauth_service, folder_id, name, work_dir
+        )
+        nested_info[name] = (drive_folder_id, local_dir, name_to_id, child_info)
+        total_files = len(name_to_id) + sum(len(c[2]) for c in child_info.values())
+        print(f"  {total_files} file(s) found in {name} across {len(child_info)} year(s).")
 
     waiting_dir = subfolder_info["DataWaiting"][1]
     completed_dir = subfolder_info["DataFilesCompleted"][1]
@@ -569,13 +688,20 @@ def main():
     # deletion is even attempted - so a problem with DataWaiting's
     # cleanup can never cost you a correctly-computed run's output.
     print("Checking for new, changed, or moved files to sync back to Drive...")
-    upload_order = [n for n in SUBFOLDERS if n != "DataWaiting"] + ["DataWaiting"]
+    upload_order = [n for n in FLAT_SUBFOLDERS if n != "DataWaiting"] + ["DataWaiting"]
     total_uploaded = 0
     for name in upload_order:
         drive_folder_id, local_dir, name_to_id = subfolder_info[name]
         total_uploaded += upload_subfolder_changes(
             service, oauth_service, drive_folder_id, local_dir, name_to_id,
             run_started_at, handle_deletions=(name in SUBFOLDER_HANDLES_DELETIONS),
+        )
+
+    for name in NESTED_SUBFOLDERS:
+        drive_folder_id, local_dir, name_to_id, child_info = nested_info[name]
+        total_uploaded += upload_nested_subfolder_set(
+            service, oauth_service, drive_folder_id, local_dir, name_to_id,
+            child_info, run_started_at,
         )
 
     print()

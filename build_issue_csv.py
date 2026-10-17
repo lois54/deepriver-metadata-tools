@@ -2,7 +2,7 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-09-01 09:15 AM EDT
+# Generated: 2026-10-17 02:05 PM EDT
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -45,10 +45,14 @@
 #                          all) is left in DataWaiting instead, so it
 #                          stays visible as something that still needs
 #                          attention.
-#   IngestFiles/          the "start-end-ingest.csv" files (+ matching
-#                          .xlsx) - the finished, ready-for-the-repository
-#                          output. Read on every run to check for
-#                          existing issues, written/updated with new ones.
+#   IngestFiles/          ONE SUBFOLDER PER CALENDAR YEAR (e.g.
+#                          IngestFiles/1883/), each holding that year's
+#                          "<year>-ingest.csv" (+ matching .xlsx) files -
+#                          the finished, ready-for-the-repository output.
+#                          Read on every run to check for existing
+#                          issues, written/updated with new ones. See
+#                          "THE PER-YEAR HOLD-BACK RULE" below for when
+#                          a year's folder does NOT get written to.
 #   MergeReports/         Ingest_merge_report_<timestamp>.txt - written
 #                          only on a "noteworthy" run (see
 #                          merge_and_write_records()).
@@ -65,9 +69,34 @@
 # whether that happened; it just reads whatever's sitting in
 # DataWaiting when it runs.
 #
+# THE PER-YEAR HOLD-BACK RULE
+# ----------------------------------------------------------------------------
+# If a year currently has a problem that can be pinned to it (an invalid
+# TIFF date, or a TIFF with no matching Town List entry - see
+# extract_year_from_problem()), that year's folder is held back
+# ENTIRELY this run: none of its issues are written, even ones that
+# matched cleanly. A year only ever gets added to in complete batches,
+# never left half-done while something about it is still wrong - once
+# the source data is fixed, the next run writes the whole year at once.
+#
+# A problem with no year attached yet (a Town List entry with no TIFF
+# match at all, or an unrecognized filename) can't block any specific
+# year this way - it's reported on its own and resolves itself
+# automatically, the normal way, once a match shows up.
+#
+# ALERT EMAIL
+# ----------------------------------------------------------------------------
+# Whenever the set of current problems differs from what last run saw
+# (something new appeared, or something cleared up), an email goes to
+# EMAIL_RECIPIENTS (see CONFIGURATION) summarizing which years are held
+# back and why, which problems aren't tied to a year yet, and anything
+# that got resolved since last time. Needs EMAIL_APP_PASSWORD set - see
+# CONFIGURATION for how to generate one; if it's not set, this step is
+# skipped with a note printed, and everything else runs normally.
+#
 # WHAT THIS SCRIPT PRODUCES
 # ----------------------------------------------------------------------------
-#   <start_year>-<end_year>-ingest.csv  (in IngestFiles/)
+#   <year>-ingest.csv  (in IngestFiles/<year>/)
 #       This is the FULL, 64-COLUMN, ingest-ready CSV - the same shape
 #       used elsewhere in the pipeline (process_newspapers.py):
 #
@@ -147,6 +176,8 @@ import csv
 import shutil
 import urllib.request
 import urllib.error
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 
 # =============================================================================
@@ -170,6 +201,24 @@ GENRE = "newspapers"
 
 # language field (column W) - every row, same value.
 LANGUAGE = "English"
+
+# ---- Error-alert email -------------------------------------------------
+# Sent whenever this run's problem picture changed from last run's (new
+# problem appeared, or one cleared) - see merge_and_write_records() and
+# build_alert_email(). Uses Gmail's SMTP server with an "app password",
+# NOT the regular account password:
+#   1. google.com/myaccount/apppasswords (2-Step Verification must
+#      already be on for the account)
+#   2. Generate one for "Mail", copy the 16-character code
+#   3. Locally: export EMAIL_APP_PASSWORD=that code
+#      In GitHub Actions: save it as a repo secret named
+#      EMAIL_APP_PASSWORD (Settings -> Secrets and variables -> Actions),
+#      and pass it to this script's step the same way GDRIVE_SA_KEY is
+#      already passed (env: EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }})
+# No password set -> the email step is silently skipped (see
+# send_error_email) rather than failing the whole run.
+EMAIL_SENDER = "loisbb@gmail.com"
+EMAIL_RECIPIENTS = ["loisbb@gmail.com"]  # add Patrick's address here later
 
 # persons field (column T) - the publisher's name changes based on the
 # issue's year (see PUBLISHER_BY_DATE below); everything else is fixed.
@@ -1620,7 +1669,19 @@ def gather_all_records(waiting_dir):
         if key in town_key_source:
             file_pending.add(town_key_source[key])
 
-    return records, all_problems, tiff_filenames, townlist_filenames, file_usable_counts, file_pending
+    # Which input file(s) contributed each YEAR's successfully-matched
+    # records - used by run_by_year() to keep a file in DataWaiting if
+    # the circuit breaker in merge_and_write_records held its year back
+    # this run, even though every one of its entries matched fine.
+    year_to_filenames = {}
+    for record in records:
+        key = record["_join_key"]
+        for src in (tiff_key_source.get(key), town_key_source.get(key)):
+            if src:
+                year_to_filenames.setdefault(record["year"], set()).add(src)
+
+    return (records, all_problems, tiff_filenames, townlist_filenames,
+            file_usable_counts, file_pending, year_to_filenames)
 
 
 # =============================================================================
@@ -1737,6 +1798,55 @@ def make_ingest_filename(directory, start_year, end_year, taken_names):
     return candidate
 
 
+# A per-year ingest file, e.g. "1883-ingest.csv" - lives inside its own
+# IngestFiles/<year>/ subfolder (see the module header, "ORGANIZED BY
+# YEAR"), so unlike INGEST_FILENAME_PATTERN above it only ever needs one
+# year, not a range. The optional "_partN" suffix is only used if a
+# single year's issues outgrow TARGET_LINES_PER_FILE and need a second
+# file within that same year folder.
+YEAR_INGEST_FILENAME_PATTERN = re.compile(
+    r'^(\d{4})-ingest(?:_part(\d+))?\.csv$', re.IGNORECASE
+)
+
+
+def find_year_ingest_files(directory):
+    """
+    Like find_ingest_files(), but for one IngestFiles/<year>/ folder -
+    every "<year>-ingest.csv" (+ "_partN") file in it, sorted so the
+    most recently started one (highest part number) comes last, since
+    that's the one still-growing file new issues get appended to.
+    """
+    files = []
+    for filename in os.listdir(directory):
+        match = YEAR_INGEST_FILENAME_PATTERN.match(filename)
+        if not match:
+            continue
+        part_text = match.group(1)
+        path = os.path.join(directory, filename)
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        files.append({
+            "filename": filename,
+            "path": path,
+            "part_num": int(part_text) if part_text else 1,
+            "rows": rows,
+        })
+
+    files.sort(key=lambda info: info["part_num"])
+    return files
+
+
+def make_year_ingest_filename(directory, year, taken_names):
+    """Build a "<year>-ingest.csv" filename for one year folder, adding
+    a "_partN" suffix only if that name is already taken."""
+    candidate = f"{year}-ingest.csv"
+    part_num = 2
+    while candidate in taken_names or os.path.exists(os.path.join(directory, candidate)):
+        candidate = f"{year}-ingest_part{part_num}.csv"
+        part_num += 1
+    return candidate
+
+
 def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
                                 source_label, problem_prefix=""):
     """
@@ -1829,6 +1939,7 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
             continue
 
         record["source_volume"] = f"Vol_{key[0]}"
+        record["_join_key"] = key  # internal use only - see gather_all_records
         records.append(record)
 
     return records, problems, pending_tiff_keys, pending_town_keys
@@ -1967,20 +2078,164 @@ def write_last_problems(directory, problems):
             f.write(p + "\n")
 
 
+# A problem description string carries a year ONLY if it mentions a
+# TIFF-derived date (an 8-digit YYYYMMDD run, from an issue_id like
+# "19110231_vXXXVIII_n08" or a raw TIFF filename) - matched loosely
+# enough to accept an invalid calendar date like Feb 31 (we just want
+# the year digits, not a valid date). A problem discovered before any
+# TIFF is involved - [missing_tiffs] (a Town List entry with nothing to
+# match yet) or [unrecognized_filename] - has no date to read a year
+# from; extract_year_from_problem() returns None for those, and they're
+# reported on their own rather than tied to (and blocking) a year - see
+# merge_and_write_records().
+PROBLEM_YEAR_PATTERN = re.compile(
+    r'(1[89]\d\d|20\d\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'
+)
+
+
+def extract_year_from_problem(problem_text):
+    """Best-effort 4-digit year pulled from a problem description, or
+    None if it doesn't contain one yet - see PROBLEM_YEAR_PATTERN."""
+    match = PROBLEM_YEAR_PATTERN.search(problem_text)
+    return match.group(1) if match else None
+
+
+def send_error_email(subject, body):
+    """
+    Emails EMAIL_RECIPIENTS a plain-text alert via Gmail's SMTP server,
+    using the app password in the EMAIL_APP_PASSWORD environment
+    variable (see the CONFIGURATION section for how to generate one).
+
+    Never raises - a failure to send (no password set, bad password, no
+    network) is printed as a warning and the run continues normally.
+    Losing the alert email is annoying; crashing the actual data
+    pipeline over it would be much worse.
+    """
+    app_password = os.environ.get("EMAIL_APP_PASSWORD")
+    if not app_password:
+        print("  (EMAIL_APP_PASSWORD not set - skipping alert email)")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = ", ".join(EMAIL_RECIPIENTS)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_SENDER, app_password)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
+        print(f"  alert email sent to {', '.join(EMAIL_RECIPIENTS)}")
+    except Exception as e:
+        print(f"  WARNING: couldn't send alert email ({e}) - continuing anyway.")
+
+
+def build_alert_email(current_problems, resolved_problems, blocked_years,
+                       held_back_counts, report_path):
+    """
+    Builds the (subject, body) for the alert email sent whenever this
+    run's problem picture changed from last run's - see
+    merge_and_write_records(). Groups problems by year where a year can
+    be determined (see extract_year_from_problem), calling out which
+    years are currently being held back (see the module header), which
+    problems were resolved since last run, and which problems have no
+    year to attach to yet.
+    """
+    by_year = {}
+    unattributed = []
+    for p in sorted(current_problems):
+        year = extract_year_from_problem(p)
+        if year:
+            by_year.setdefault(year, []).append(p)
+        else:
+            unattributed.append(p)
+
+    lines = []
+    if blocked_years:
+        lines.append(
+            f"{len(blocked_years)} year(s) have issue(s) ready but held "
+            f"back until the problem below is fixed:"
+        )
+        lines.append("")
+        for year in sorted(blocked_years):
+            count = held_back_counts.get(year, 0)
+            noun = "issue" if count == 1 else "issues"
+            lines.append(f"{year} ({count} {noun} waiting):")
+            for p in by_year.get(year, []):
+                lines.append(f"  - {p}")
+            lines.append("")
+    else:
+        lines.append("No year is currently being held back.")
+        lines.append("")
+
+    other_years = sorted(set(by_year) - blocked_years)
+    if other_years:
+        lines.append("Other current problems (not holding anything back):")
+        for year in other_years:
+            for p in by_year[year]:
+                lines.append(f"  - {p}")
+        lines.append("")
+
+    if unattributed:
+        lines.append(
+            "Not yet tied to a specific year (will resolve automatically "
+            "once a match shows up):"
+        )
+        for p in unattributed:
+            lines.append(f"  - {p}")
+        lines.append("")
+
+    if resolved_problems:
+        lines.append("RESOLVED since the last run:")
+        for p in sorted(resolved_problems):
+            lines.append(f"  - {p}")
+        lines.append("")
+
+    if report_path:
+        lines.append(f"Full report: {report_path}")
+
+    if blocked_years:
+        noun = "year" if len(blocked_years) == 1 else "years"
+        subject = f"Newspaper pipeline: {len(blocked_years)} {noun} held back"
+    elif current_problems:
+        subject = "Newspaper pipeline: problems to review (nothing held back)"
+    else:
+        subject = "Newspaper pipeline: all clear"
+
+    return subject, "\n".join(lines) + "\n"
+
+
 def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
                              volume_problems, source_line):
     """
     The shared merge/dedup/write engine, used by BOTH the default
-    directory-scanning mode and manual single-pair mode. See the module
-    comment above run_by_year() for the merge rules and file-naming
-    convention.
+    directory-scanning mode and manual single-pair mode.
+
+    ORGANIZED BY YEAR: records are grouped by calendar year and merged
+    into ingest_dir/<year>/ one year at a time - e.g. IngestFiles/1883/
+    holds every "1883-ingest.csv" (+ "_partN") file for that year. This
+    matches Patrick's one-year-at-a-time review workflow directly.
+
+    HOLD-BACK / CIRCUIT BREAKER: a year with a problem that can be
+    pinned to that year right now (see extract_year_from_problem) is
+    held back ENTIRELY this run - none of its new issues are written,
+    even ones that matched cleanly - so a year is only ever added to in
+    complete batches, never left half-written while something about it
+    is still wrong. A problem that can't be pinned to a year yet (a
+    Town List entry with no TIFF match, or an unrecognized filename)
+    never blocks any year; it's reported on its own and resolves itself
+    automatically the normal way once a match shows up.
+
+    Nothing is lost by holding a year back - all_records is recomputed
+    fresh from DataWaiting every run, so a held-back issue is simply
+    recomputed and retried next run, same as any other not-yet-matched
+    issue already works today.
 
     log_root         - the root folder _Logs lives under (run_log.txt,
                         last_problems.txt) - unaffected by the
                         four-folder split, since _Logs stays at the root
-    ingest_dir        - where existing "start-end-ingest.csv" files live,
-                        and where new/updated ones (+ matching .xlsx)
-                        get written (IngestFiles/ in the default mode)
+    ingest_dir        - the IngestFiles root; year subfolders live
+                        directly under it
     reports_dir       - where Ingest_merge_report_<timestamp>.txt gets
                         written (MergeReports/ in the default mode)
     all_records      - every issue record to merge in (from
@@ -1991,25 +2246,39 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
 
     In manual single-pair mode, log_root, ingest_dir, and reports_dir
     are all the same folder - see main() - preserving that mode's
-    original flat, single-folder behavior.
-    """
-    # ---- Load whatever ingest files already exist -----------------------
-    existing_files = find_ingest_files(ingest_dir)
-    existing_by_id = {}
-    for info in existing_files:
-        for row in info["rows"]:
-            if row.get("model") == "Publication Issue" and row.get("local_identifier"):
-                existing_by_id[row["local_identifier"]] = row
+    original flat, single-folder behavior (year subfolders still get
+    created under it).
 
-    # ---- Sort out matched / mismatched / genuinely-new issues -----------
-    # counts_by_source tracks these same three outcomes PER source_volume
-    # (e.g. per tifflist file), so the report can show a breakdown rather
-    # than just one combined total - otherwise there's no way to confirm
-    # from the report alone that every source's issues actually made it in.
-    new_records = []
+    Returns blocked_years - the set of years held back this run, so the
+    caller (run_by_year) can keep their contributing source files in
+    DataWaiting instead of moving them to DataFilesCompleted.
+    """
+    current_problems = set(volume_problems)
+    blocked_years = {
+        year for p in current_problems
+        for year in [extract_year_from_problem(p)] if year
+    }
+
+    records_by_year = {}
+    for record in all_records:
+        records_by_year.setdefault(record["year"], []).append(record)
+
+    all_years = sorted(set(records_by_year) | blocked_years)
+
+    # ---- Per-year merge loop ---------------------------------------------
+    # counts_by_source tracks new/matched/mismatch PER source_volume
+    # (e.g. per tifflist file) across ALL years combined, so the report
+    # can show a breakdown - otherwise there's no way to confirm from
+    # the report alone that every source's issues actually made it in.
     matched_count = 0
     mismatch_lines = []
     counts_by_source = {}
+    held_back_counts = {}  # year -> count of matched-but-withheld issues
+    written_files = []
+    added_total = 0
+    new_pages_total = 0
+    matched_pages_total = 0
+    mismatch_pages_total = 0
 
     def bump(source_volume, outcome, page_count):
         entry = counts_by_source.setdefault(
@@ -2020,56 +2289,65 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         entry[outcome] += 1
         entry[f"{outcome}_pages"] += page_count
 
-    for record in sorted(all_records, key=lambda r: r["date"]):
-        issue_id = record["issue_id"]
-        page_count = len(record["pages"])
+    for year in all_years:
+        is_blocked = year in blocked_years
+        year_dir = os.path.join(ingest_dir, year)
+        existing_files = find_year_ingest_files(year_dir) if os.path.isdir(year_dir) else []
+        existing_by_id = {}
+        for info in existing_files:
+            for row in info["rows"]:
+                if row.get("model") == "Publication Issue" and row.get("local_identifier"):
+                    existing_by_id[row["local_identifier"]] = row
 
-        if issue_id in existing_by_id:
-            new_parent = normalize_for_compare(build_parent_row_dict(record))
-            old_parent = normalize_for_compare(existing_by_id[issue_id])
-            if new_parent == old_parent:
-                matched_count += 1
-                bump(record["source_volume"], "matched", page_count)
-            else:
-                mismatch_lines.append(
-                    f"  - {issue_id} ({record['source_volume']}) already "
-                    f"exists but the new data differs. NOT overwritten - "
-                    f"please review manually."
-                )
-                bump(record["source_volume"], "mismatch", page_count)
-            continue
+        year_new_records = []
+        for record in sorted(records_by_year.get(year, []), key=lambda r: r["date"]):
+            issue_id = record["issue_id"]
+            page_count = len(record["pages"])
 
-        new_records.append(record)
-        bump(record["source_volume"], "new", page_count)
+            if issue_id in existing_by_id:
+                new_parent = normalize_for_compare(build_parent_row_dict(record))
+                old_parent = normalize_for_compare(existing_by_id[issue_id])
+                if new_parent == old_parent:
+                    matched_count += 1
+                    matched_pages_total += page_count
+                    bump(record["source_volume"], "matched", page_count)
+                else:
+                    mismatch_lines.append(
+                        f"  - {issue_id} ({record['source_volume']}) already "
+                        f"exists but the new data differs. NOT overwritten - "
+                        f"please review manually."
+                    )
+                    mismatch_pages_total += page_count
+                    bump(record["source_volume"], "mismatch", page_count)
+                continue
 
-    new_pages_total = sum(c["new_pages"] for c in counts_by_source.values())
-    matched_pages_total = sum(c["matched_pages"] for c in counts_by_source.values())
-    mismatch_pages_total = sum(c["mismatch_pages"] for c in counts_by_source.values())
+            if is_blocked:
+                held_back_counts[year] = held_back_counts.get(year, 0) + 1
+                continue  # not written this run - see docstring
 
-    # ---- Write the new issues: continue the most recent file if it has
-    # room, otherwise start fresh; roll into further new files as needed.
-    written_files = []
-    added_total = 0
+            year_new_records.append(record)
+            bump(record["source_volume"], "new", page_count)
+            new_pages_total += page_count
 
-    if new_records:
-        active_file = None
-        if existing_files:
-            candidate = existing_files[-1]  # chronologically latest
-            new_records_min_year = min(int(r["year"]) for r in new_records)
-            year_gap = new_records_min_year - int(candidate["end_year"]) > MAX_CONTIGUOUS_YEAR_GAP
-            if 1 + len(candidate["rows"]) < TARGET_LINES_PER_FILE and not year_gap:
-                active_file = candidate
+        if not year_new_records:
+            continue  # nothing new to write for this year
 
+        year_dir = ensure_subdir(ingest_dir, year)
         taken_names = {info["filename"] for info in existing_files}
-        start_line_count = 1 + len(active_file["rows"]) if active_file else 1
+        active_file = existing_files[-1] if existing_files else None
+        can_continue = (
+            active_file is not None
+            and 1 + len(active_file["rows"]) < TARGET_LINES_PER_FILE
+        )
+        start_line_count = 1 + len(active_file["rows"]) if can_continue else 1
         chunks = chunk_records_by_line_limit(
-            new_records, start_line_count=start_line_count
+            year_new_records, start_line_count=start_line_count
         )
 
         for i, chunk in enumerate(chunks):
             chunk_rows_out = []
 
-            if i == 0 and active_file is not None:
+            if i == 0 and can_continue:
                 # Continue the existing active file, in place.
                 existing_rows = active_file["rows"]
                 next_id = (
@@ -2084,34 +2362,19 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
                     writer = csv.DictWriter(f, fieldnames=COLUMNS)
                     writer.writerows(chunk_rows_out)
 
-                # The file's content range may have grown - rename it to
-                # match if so.
-                new_start = min(active_file["start_year"], *(r["year"] for r in chunk))
-                new_end = max(active_file["end_year"], *(r["year"] for r in chunk))
-                final_path = active_file["path"]
-                if (new_start, new_end) != (active_file["start_year"], active_file["end_year"]):
-                    taken_names.discard(active_file["filename"])
-                    new_filename = make_ingest_filename(ingest_dir, new_start, new_end, taken_names)
-                    new_path = os.path.join(ingest_dir, new_filename)
-                    os.rename(active_file["path"], new_path)
-                    final_path = new_path
-                    taken_names.add(new_filename)
-                else:
-                    taken_names.add(active_file["filename"])
-
-                written_files.append(final_path)
+                written_files.append(active_file["path"])
+                taken_names.add(active_file["filename"])
 
             else:
-                # A brand-new file, named after this chunk's own date range.
+                # A brand-new file for this year (first one, or another
+                # part if the year outgrew TARGET_LINES_PER_FILE).
                 next_id = 1
                 for record in chunk:
                     rows, next_id = rows_from_issue_record(record, next_id)
                     chunk_rows_out.extend(rows)
 
-                start_year = min(r["year"] for r in chunk)
-                end_year = max(r["year"] for r in chunk)
-                filename = make_ingest_filename(ingest_dir, start_year, end_year, taken_names)
-                path = os.path.join(ingest_dir, filename)
+                filename = make_year_ingest_filename(year_dir, year, taken_names)
+                path = os.path.join(year_dir, filename)
 
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=COLUMNS)
@@ -2138,8 +2401,8 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # made it into a report once, and nothing about it has changed
     # since. This matters a lot now that this runs 5x a day rather than
     # on-demand - most runs genuinely have nothing new to say.
-    current_problems = set(volume_problems)
-    problems_changed = current_problems != read_last_problems(log_root)
+    previous_problems = read_last_problems(log_root)
+    problems_changed = current_problems != previous_problems
     noteworthy = bool(added_total) or bool(mismatch_lines) or problems_changed
 
     report_path = None
@@ -2152,7 +2415,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Root directory: {log_root}",
             f"Input files read from: {DATA_WAITING_SUBDIR}/",
-            f"Ingest files written to: {ingest_dir}",
+            f"Ingest files written to: {ingest_dir} (one subfolder per year)",
             source_line,
             "",
             f"New issues added: {added_total} ({new_pages_total} pages)",
@@ -2177,6 +2440,15 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             lines.extend(f"  - {path}" for path in written_files)
             lines.append("")
 
+        if held_back_counts:
+            lines.append(
+                "YEARS HELD BACK THIS RUN (issue(s) matched but not written "
+                "- see problems below):"
+            )
+            for year in sorted(held_back_counts):
+                lines.append(f"  - {year}: {held_back_counts[year]} issue(s) waiting")
+            lines.append("")
+
         if mismatch_lines:
             lines.append("DUPLICATES WITH DIFFERING DATA:")
             lines.extend(mismatch_lines)
@@ -2195,9 +2467,23 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # against.
     write_last_problems(log_root, current_problems)
 
+    # ---- Alert email - only when the problem picture actually changed ---
+    # (a new problem appeared, or one cleared up) - same signal already
+    # used for "noteworthy" above, so an unattended schedule running 5x
+    # a day doesn't send the same email about the same unresolved issue
+    # over and over.
+    if problems_changed:
+        resolved_problems = previous_problems - current_problems
+        subject, body = build_alert_email(
+            current_problems, resolved_problems, blocked_years,
+            held_back_counts, report_path,
+        )
+        send_error_email(subject, body)
+
     summary = (
         f"new={added_total} matched={matched_count} "
-        f"differing={len(mismatch_lines)} problems={len(current_problems)}"
+        f"differing={len(mismatch_lines)} problems={len(current_problems)} "
+        f"held_back_years={len(blocked_years)}"
     )
     if report_path:
         append_run_log(log_root, f"{summary} -> {os.path.basename(report_path)}")
@@ -2221,11 +2507,17 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         print("  Files written/updated:")
         for path in written_files:
             print(f"    - {path}")
+    if held_back_counts:
+        print("  Years held back this run (pending a fix):")
+        for year in sorted(held_back_counts):
+            print(f"    - {year}: {held_back_counts[year]} issue(s) waiting")
     if report_path:
         print(f"  Process report: {report_path}")
     else:
         print("  Nothing new since last run - no report file written "
               f"(see {LOGS_SUBDIR_NAME}/{RUN_LOG_FILENAME} for a record of this run).")
+
+    return blocked_years
 
 
 def run_by_year(directory):
@@ -2243,7 +2535,8 @@ def run_by_year(directory):
     reports_dir = ensure_subdir(directory, MERGE_REPORTS_SUBDIR)
 
     print(f"Scanning {waiting_dir} for tifflist and Town List files...")
-    all_records, problems, tiff_filenames, townlist_filenames, file_usable_counts, file_pending = (
+    (all_records, problems, tiff_filenames, townlist_filenames,
+     file_usable_counts, file_pending, year_to_filenames) = (
         gather_all_records(waiting_dir)
     )
 
@@ -2260,8 +2553,17 @@ def run_by_year(directory):
         f"Tifflist files read: {', '.join(tiff_filenames) or '(none)'}\n"
         f"Town List files read: {', '.join(townlist_filenames) or '(none)'}"
     )
-    merge_and_write_records(directory, ingest_dir, reports_dir, all_records,
-                             problems, source_line)
+    blocked_years = merge_and_write_records(
+        directory, ingest_dir, reports_dir, all_records, problems, source_line
+    )
+
+    # A file whose records all matched fine, but whose YEAR got held
+    # back this run by the circuit breaker in merge_and_write_records,
+    # needs to stay in DataWaiting too - its data wasn't actually
+    # written, so it's not safe to treat as "done" yet. Add it to
+    # file_pending alongside the usual missing-match/invalid-date cases.
+    for year in blocked_years:
+        file_pending.update(year_to_filenames.get(year, set()))
 
     # Move every input file that contributed at least one usable record
     # AND has nothing still pending a match out of DataWaiting into
