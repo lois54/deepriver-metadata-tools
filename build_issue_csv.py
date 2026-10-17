@@ -179,6 +179,28 @@ import urllib.error
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Every "Run at" / log timestamp uses Eastern time explicitly (not
+# whatever timezone the machine running this happens to be in) - this
+# runs on GitHub Actions runners, which are UTC, but is read by someone
+# in Connecticut. ZoneInfo handles the EDT/EST switch automatically.
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def now_eastern():
+    """The current moment, in US Eastern time."""
+    return datetime.now(EASTERN_TZ)
+
+
+def format_eastern_timestamp(dt=None):
+    """'2026-10-17 02:07:32 PM EDT' - the display format used for every
+    run-time stamp in the merge report, the run log, and the alert
+    email. Pass a specific now_eastern() result to keep several
+    timestamps in one run perfectly in sync; omit it to use right now."""
+    if dt is None:
+        dt = now_eastern()
+    return dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 # =============================================================================
 # CONFIGURATION - fixed values that go into every "Publication Issue" row.
@@ -2054,7 +2076,7 @@ def append_run_log(directory, message):
     pile up files for everyone browsing the main Drive folder.
     """
     log_path = os.path.join(logs_dir_path(directory), RUN_LOG_FILENAME)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = format_eastern_timestamp()
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"{timestamp}  {message}\n")
 
@@ -2130,59 +2152,121 @@ def send_error_email(subject, body):
         print(f"  WARNING: couldn't send alert email ({e}) - continuing anyway.")
 
 
+# Human-readable labels for the alert email - see build_alert_email().
+# Any category not listed here just prints its raw [bracket_name].
+PROBLEM_CATEGORY_LABELS = {
+    "missing_town_list": "missing town list",
+    "missing_tiffs": "missing tiffs",
+    "invalid_date": "invalid date",
+    "duplicate_town_list_entry": "duplicate town list entries",
+    "duplicate_tiff_entry": "duplicate tiff entries",
+}
+
+# Categories printed VERBATIM, one full line each, under "Needs a look"
+# in the alert email, rather than folded into a year/count summary -
+# these are rare, one-off problems (a whole file that wouldn't read, a
+# filename nothing recognized) where the specific detail matters more
+# than a count, and there's usually only one or two of them per run.
+PROBLEM_CATEGORY_VERBATIM = {"file_read_error", "unrecognized_filename"}
+
+PROBLEM_CATEGORY_PATTERN = re.compile(r'\[(\w+)\]')
+INVALID_DATE_VALUE_PATTERN = re.compile(r"invalid date \('([^']+)'\)")
+
+
 def build_alert_email(current_problems, resolved_problems, blocked_years,
-                       held_back_counts, report_path):
+                       new_summary_by_year, report_path, waiting_subdir,
+                       ingest_dir_label, source_line):
     """
     Builds the (subject, body) for the alert email sent whenever this
     run's problem picture changed from last run's - see
-    merge_and_write_records(). Groups problems by year where a year can
-    be determined (see extract_year_from_problem), calling out which
-    years are currently being held back (see the module header), which
-    problems were resolved since last run, and which problems have no
-    year to attach to yet.
+    merge_and_write_records(). Unlike the full merge report (one line
+    per issue), this stays short: one line per year summing up how many
+    problems of each kind it has, one line per category of problem that
+    isn't tied to a year yet, and the handful of genuinely one-off
+    problems (see PROBLEM_CATEGORY_VERBATIM) printed out in full.
+
+    new_summary_by_year - {year: {count, pages, min_date, max_date}} for
+    issues actually written this run (see merge_and_write_records).
     """
-    by_year = {}
-    unattributed = []
+    by_year_category = {}       # year -> category -> count
+    invalid_dates_by_year = {}  # year -> [bad date strings]
+    aggregate_by_category = {}  # category (no year) -> count
+    needs_a_look = []
+
     for p in sorted(current_problems):
+        match = PROBLEM_CATEGORY_PATTERN.search(p)
+        category = match.group(1) if match else "other"
+
+        if category in PROBLEM_CATEGORY_VERBATIM:
+            needs_a_look.append(p)
+            continue
+
         year = extract_year_from_problem(p)
         if year:
-            by_year.setdefault(year, []).append(p)
+            year_counts = by_year_category.setdefault(year, {})
+            year_counts[category] = year_counts.get(category, 0) + 1
+            if category == "invalid_date":
+                date_match = INVALID_DATE_VALUE_PATTERN.search(p)
+                if date_match:
+                    invalid_dates_by_year.setdefault(year, []).append(date_match.group(1))
         else:
-            unattributed.append(p)
+            aggregate_by_category[category] = aggregate_by_category.get(category, 0) + 1
 
-    lines = []
-    if blocked_years:
-        lines.append(
-            f"{len(blocked_years)} year(s) have issue(s) ready but held "
-            f"back until the problem below is fixed:"
-        )
-        lines.append("")
-        for year in sorted(blocked_years):
-            count = held_back_counts.get(year, 0)
-            noun = "issue" if count == 1 else "issues"
-            lines.append(f"{year} ({count} {noun} waiting):")
-            for p in by_year.get(year, []):
-                lines.append(f"  - {p}")
-            lines.append("")
+    lines = [
+        f"Run at: {format_eastern_timestamp()}",
+        f"Input files read from: {waiting_subdir}/",
+        f"Ingest files written to: {ingest_dir_label}",
+        source_line,
+        "",
+    ]
+
+    if new_summary_by_year:
+        lines.append("New issues added:")
+        for year in sorted(new_summary_by_year):
+            s = new_summary_by_year[year]
+            noun = "issue" if s["count"] == 1 else "issues"
+            date_range = (
+                f"{format_date_long(s['min_date'])} thru {format_date_long(s['max_date'])}"
+            )
+            lines.append(f"  {year}: {s['count']} {noun} ({s['pages']} pages), {date_range}")
     else:
-        lines.append("No year is currently being held back.")
+        lines.append("New issues added: none this run")
+    lines.append("")
+
+    if by_year_category:
+        lines.append("Problems by year:")
+        for year in sorted(by_year_category):
+            parts = []
+            for category in sorted(by_year_category[year]):
+                count = by_year_category[year][category]
+                label = PROBLEM_CATEGORY_LABELS.get(category, category)
+                if category == "invalid_date" and invalid_dates_by_year.get(year):
+                    dates_str = ", ".join(f"'{d}'" for d in invalid_dates_by_year[year])
+                    parts.append(f"{count} {label} ({dates_str})")
+                else:
+                    parts.append(f"{count} {label}")
+            lines.append(f"  {year}: " + "; ".join(parts))
         lines.append("")
 
-    other_years = sorted(set(by_year) - blocked_years)
-    if other_years:
-        lines.append("Other current problems (not holding anything back):")
-        for year in other_years:
-            for p in by_year[year]:
-                lines.append(f"  - {p}")
+    if aggregate_by_category:
+        lines.append("Problems not tied to a specific year yet:")
+        for category in sorted(aggregate_by_category):
+            label = PROBLEM_CATEGORY_LABELS.get(category, category)
+            lines.append(f"  {aggregate_by_category[category]} {label}")
         lines.append("")
 
-    if unattributed:
-        lines.append(
-            "Not yet tied to a specific year (will resolve automatically "
-            "once a match shows up):"
-        )
-        for p in unattributed:
+    if needs_a_look:
+        lines.append("Needs a look:")
+        for p in needs_a_look:
             lines.append(f"  - {p}")
+        lines.append("")
+
+    if blocked_years:
+        noun = "year" if len(blocked_years) == 1 else "years"
+        lines.append(
+            f"{len(blocked_years)} {noun} held back until fixed: "
+            f"{', '.join(sorted(blocked_years))}"
+        )
         lines.append("")
 
     if resolved_problems:
@@ -2279,6 +2363,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     new_pages_total = 0
     matched_pages_total = 0
     mismatch_pages_total = 0
+    new_summary_by_year = {}  # year -> {count, pages, min_date, max_date}
 
     def bump(source_volume, outcome, page_count):
         entry = counts_by_source.setdefault(
@@ -2328,6 +2413,17 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             year_new_records.append(record)
             bump(record["source_volume"], "new", page_count)
             new_pages_total += page_count
+
+        if year_new_records:
+            # One compact line per year for the alert email - see
+            # build_alert_email() - instead of a line per issue.
+            dates = [r["date"] for r in year_new_records]
+            new_summary_by_year[year] = {
+                "count": len(year_new_records),
+                "pages": sum(len(r["pages"]) for r in year_new_records),
+                "min_date": min(dates),
+                "max_date": max(dates),
+            }
 
         if not year_new_records:
             continue  # nothing new to write for this year
@@ -2407,12 +2503,13 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
 
     report_path = None
     if noteworthy:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_moment = now_eastern()
+        timestamp = run_moment.strftime("%Y%m%d_%H%M%S")
         report_path = os.path.join(reports_dir, f"Ingest_merge_report_{timestamp}.txt")
 
         lines = [
             "Ingest merge report",
-            f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Run at: {format_eastern_timestamp(run_moment)}",
             f"Root directory: {log_root}",
             f"Input files read from: {DATA_WAITING_SUBDIR}/",
             f"Ingest files written to: {ingest_dir} (one subfolder per year)",
@@ -2474,9 +2571,18 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # over and over.
     if problems_changed:
         resolved_problems = previous_problems - current_problems
+        report_label = (
+            f"/{MERGE_REPORTS_SUBDIR}/{os.path.basename(report_path)}"
+            if report_path else None
+        )
+        ingest_dir_label = (
+            f"{os.path.basename(ingest_dir.rstrip(os.sep)) or INGEST_FILES_SUBDIR}/ "
+            f"(one subfolder per year)"
+        )
         subject, body = build_alert_email(
             current_problems, resolved_problems, blocked_years,
-            held_back_counts, report_path,
+            new_summary_by_year, report_label, DATA_WAITING_SUBDIR,
+            ingest_dir_label, source_line,
         )
         send_error_email(subject, body)
 
