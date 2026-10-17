@@ -2173,32 +2173,33 @@ PROBLEM_CATEGORY_PATTERN = re.compile(r'\[(\w+)\]')
 INVALID_DATE_VALUE_PATTERN = re.compile(r"invalid date \('([^']+)'\)")
 
 
-def build_alert_email(current_problems, resolved_problems, blocked_years,
-                       new_summary_by_year, report_path, waiting_subdir,
-                       ingest_dir_label, source_line):
+def group_problems(problems):
     """
-    Builds the (subject, body) for the alert email sent whenever this
-    run's problem picture changed from last run's - see
-    merge_and_write_records(). Unlike the full merge report (one line
-    per issue), this stays short: one line per year summing up how many
-    problems of each kind it has, one line per category of problem that
-    isn't tied to a year yet, and the handful of genuinely one-off
-    problems (see PROBLEM_CATEGORY_VERBATIM) printed out in full.
+    Sorts a set of raw problem strings into the buckets the alert email
+    summarizes from: by_year_category (year -> category -> count),
+    invalid_dates_by_year (year -> [bad date strings], for folding the
+    actual bad value into that year's summary line),
+    aggregate_by_category (category -> count, for problems with no
+    year yet), and verbatim_counts (category -> count, for the rare
+    one-off categories in PROBLEM_CATEGORY_VERBATIM - counted here, not
+    listed out, so a pile of them doesn't blow up the email).
 
-    new_summary_by_year - {year: {count, pages, min_date, max_date}} for
-    issues actually written this run (see merge_and_write_records).
+    Shared by both the current-problems summary and the
+    resolved-problems summary in build_alert_email(), so a fix that
+    clears 600 problems in one run produces a short "resolved" count
+    just like 600 new problems would produce a short "current" count.
     """
-    by_year_category = {}       # year -> category -> count
-    invalid_dates_by_year = {}  # year -> [bad date strings]
-    aggregate_by_category = {}  # category (no year) -> count
-    needs_a_look = []
+    by_year_category = {}
+    invalid_dates_by_year = {}
+    aggregate_by_category = {}
+    verbatim_counts = {}
 
-    for p in sorted(current_problems):
+    for p in problems:
         match = PROBLEM_CATEGORY_PATTERN.search(p)
         category = match.group(1) if match else "other"
 
         if category in PROBLEM_CATEGORY_VERBATIM:
-            needs_a_look.append(p)
+            verbatim_counts[category] = verbatim_counts.get(category, 0) + 1
             continue
 
         year = extract_year_from_problem(p)
@@ -2212,6 +2213,77 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
         else:
             aggregate_by_category[category] = aggregate_by_category.get(category, 0) + 1
 
+    return by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts
+
+
+def format_problem_summary_lines(problems, verbatim_as_lines=False):
+    """
+    The shared "N category; M category" per-year summary block, used
+    for both the current-problems section and the resolved-problems
+    section of the alert email. Returns a list of lines (no trailing
+    blank line) - empty if there's nothing to report.
+
+    verbatim_as_lines - True to print PROBLEM_CATEGORY_VERBATIM
+    problems out in full (one line each, for the "Needs a look"
+    section, where the exact text is the point); False to fold them
+    into a short count instead (for the resolved section, where only
+    "it's fixed" matters, not the original wording).
+    """
+    by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts = (
+        group_problems(problems)
+    )
+    lines = []
+
+    if by_year_category:
+        for year in sorted(by_year_category):
+            parts = []
+            for category in sorted(by_year_category[year]):
+                count = by_year_category[year][category]
+                label = PROBLEM_CATEGORY_LABELS.get(category, category)
+                if category == "invalid_date" and invalid_dates_by_year.get(year):
+                    dates_str = ", ".join(f"'{d}'" for d in invalid_dates_by_year[year])
+                    parts.append(f"{count} {label} ({dates_str})")
+                else:
+                    parts.append(f"{count} {label}")
+            lines.append(f"  {year}: " + "; ".join(parts))
+
+    if aggregate_by_category:
+        for category in sorted(aggregate_by_category):
+            label = PROBLEM_CATEGORY_LABELS.get(category, category)
+            lines.append(f"  {aggregate_by_category[category]} {label} (no year yet)")
+
+    if verbatim_as_lines:
+        for p in sorted(problems):
+            match = PROBLEM_CATEGORY_PATTERN.search(p)
+            category = match.group(1) if match else "other"
+            if category in PROBLEM_CATEGORY_VERBATIM:
+                lines.append(f"  - {p}")
+    elif verbatim_counts:
+        for category in sorted(verbatim_counts):
+            label = PROBLEM_CATEGORY_LABELS.get(category, category)
+            lines.append(f"  {verbatim_counts[category]} {label}")
+
+    return lines
+
+
+def build_alert_email(current_problems, resolved_problems, blocked_years,
+                       new_summary_by_year, report_path, waiting_subdir,
+                       ingest_dir_label, source_line):
+    """
+    Builds the (subject, body) for the alert email sent whenever this
+    run's problem picture changed from last run's - see
+    merge_and_write_records(). Unlike the full merge report (one line
+    per issue), this stays short: one line per year summing up how many
+    problems of each kind it has, one line per category of problem that
+    isn't tied to a year yet, and the handful of genuinely one-off
+    problems (see PROBLEM_CATEGORY_VERBATIM) printed out in full for
+    CURRENT problems only - resolved problems get the same by-year/
+    by-category counts but no verbatim text, since what matters there
+    is just that they're gone.
+
+    new_summary_by_year - {year: {count, pages, min_date, max_date}} for
+    issues actually written this run (see merge_and_write_records).
+    """
     lines = [
         f"Run at: {format_eastern_timestamp()}",
         f"Input files read from: {waiting_subdir}/",
@@ -2232,6 +2304,10 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
     else:
         lines.append("New issues added: none this run")
     lines.append("")
+
+    by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts = (
+        group_problems(current_problems)
+    )
 
     if by_year_category:
         lines.append("Problems by year:")
@@ -2255,10 +2331,13 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
             lines.append(f"  {aggregate_by_category[category]} {label}")
         lines.append("")
 
-    if needs_a_look:
+    if verbatim_counts:
         lines.append("Needs a look:")
-        for p in needs_a_look:
-            lines.append(f"  - {p}")
+        for p in sorted(current_problems):
+            match = PROBLEM_CATEGORY_PATTERN.search(p)
+            category = match.group(1) if match else "other"
+            if category in PROBLEM_CATEGORY_VERBATIM:
+                lines.append(f"  - {p}")
         lines.append("")
 
     if blocked_years:
@@ -2269,10 +2348,10 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
         )
         lines.append("")
 
-    if resolved_problems:
-        lines.append("RESOLVED since the last run:")
-        for p in sorted(resolved_problems):
-            lines.append(f"  - {p}")
+    resolved_summary = format_problem_summary_lines(resolved_problems, verbatim_as_lines=False)
+    if resolved_summary:
+        lines.append(f"RESOLVED since the last run ({len(resolved_problems)} total):")
+        lines.extend(resolved_summary)
         lines.append("")
 
     if report_path:
