@@ -178,7 +178,7 @@ import urllib.request
 import urllib.error
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Every "Run at" / log timestamp uses Eastern time explicitly (not
@@ -686,8 +686,11 @@ def cell_to_text(value):
 
 def parse_town_list(grid):
     """
-    Parse a Town List grid (see read_grid) into a dictionary that maps:
-        paper number (int)  ->  list of town names (list of str)
+    Parse a Town List grid (see read_grid) into (town_list, town_dates):
+        town_list  - dict[(volume, paper_no)] -> list of town names
+        town_dates - dict[(volume, paper_no)] -> date_iso, wherever a
+                     filename column supplied one (may be empty - see
+                     each parse_format_* function's own docstring)
 
     Auto-detects which of THREE possible layouts the grid is in, and
     calls the matching parser below:
@@ -761,7 +764,15 @@ def parse_format_a_rows(grid):
     found at all, there's no way to tell which issue each row belongs
     to, and we give up with an error.
 
-    Returns dict[(volume_or_None, paper_no)] -> list of town names.
+    Returns (town_list, town_dates):
+      town_list  - dict[(volume_or_None, paper_no)] -> list of town names
+      town_dates - dict[(volume_or_None, paper_no)] -> date_iso, for
+                   whichever rows got a date from a filename reference
+                   column (empty if there is no such column at all -
+                   e.g. a plain "No." layout with no filename
+                   reference). Used only to enrich a later
+                   missing_tiffs problem with a date, when available -
+                   see records_from_single_source.
     """
     header_row = grid[0]
 
@@ -802,10 +813,12 @@ def parse_format_a_rows(grid):
             )
 
     town_list = {}
+    town_dates = {}  # (volume, paper_no) -> date_iso, wherever a filename gave us one
 
     # Walk every data row (skip the header row itself).
     for row in grid[1:]:
         volume = None
+        date_iso = None
 
         if paper_no_col is not None:
             if paper_no_col >= len(row):
@@ -820,19 +833,20 @@ def parse_format_a_rows(grid):
             if reference_col is not None and reference_col < len(row):
                 parsed = parse_issue_prefix(row[reference_col])
                 if parsed:
-                    volume, _ = parsed
+                    date_iso, volume, _ = parsed
 
             towns_start_col = paper_no_col + 1
         else:
             # Fallback case: the filename column is our only source of
-            # a paper number, and it gives us the volume for free too.
+            # a paper number, and it gives us the volume AND the date
+            # for free too.
             if reference_col >= len(row):
                 continue  # row is too short to even have a filename
 
             parsed = parse_issue_prefix(row[reference_col])
             if not parsed:
                 continue  # doesn't look like an issue filename - skip
-            volume, paper_no = parsed
+            date_iso, volume, paper_no = parsed
 
             towns_start_col = reference_col + 1
 
@@ -846,8 +860,10 @@ def parse_format_a_rows(grid):
         ]
 
         town_list[(volume, paper_no)] = towns
+        if date_iso:
+            town_dates[(volume, paper_no)] = date_iso
 
-    return town_list
+    return town_list, town_dates
 
 
 def parse_format_b_transposed(grid):
@@ -865,8 +881,10 @@ def parse_format_b_transposed(grid):
 
     This format has no per-row volume reference, so every entry's
     volume is left as None (to be resolved later from context - see
-    resolve_town_list_volumes()). Returns dict[(None, paper_no)] ->
-    list of town names.
+    resolve_town_list_volumes()). Returns (town_list, town_dates) -
+    town_dates is always empty here, since there's no filename column
+    to pull a date from (kept only so every parse_format_* function
+    has the same return shape - see parse_town_list).
     """
     header_row = grid[0]
     town_list = {}
@@ -890,7 +908,7 @@ def parse_format_b_transposed(grid):
 
         town_list[(None, paper_no)] = towns
 
-    return town_list
+    return town_list, {}
 
 
 SUBJECT_ENTRY_PATTERN = re.compile(r'^Newspaper -- (.+), CT$')
@@ -925,14 +943,17 @@ def parse_format_c_slim(grid):
     blank, is skipped quietly - it'll simply show up later as a
     missing_town_list problem for that issue, same as any other gap.
 
-    Returns dict[(volume, paper_no)] -> list of town names, same shape
-    as every other format's parser.
+    Returns (town_list, town_dates), same shape as every other
+    format's parser - town_dates is filled in for every row here,
+    since the filename column this format requires always gives us a
+    date for free alongside the volume and paper number.
     """
     header_row = grid[0]
     header_lower = [cell.strip().lower() for cell in header_row]
     subject_col = header_lower.index("subject")
 
     town_list = {}
+    town_dates = {}
 
     for row in grid[1:]:
         if not row or not row[0].strip():
@@ -942,7 +963,7 @@ def parse_format_c_slim(grid):
         if parsed is None:
             continue  # not a recognizable "yyyymmdd_vVOL_nNN..." filename
 
-        volume, paper_no = parsed
+        date_iso, volume, paper_no = parsed
 
         towns = []
         if subject_col < len(row) and row[subject_col].strip():
@@ -952,8 +973,10 @@ def parse_format_c_slim(grid):
                     towns.append(match.group(1))
 
         town_list[(volume, paper_no)] = towns
+        if date_iso:
+            town_dates[(volume, paper_no)] = date_iso
 
-    return town_list
+    return town_list, town_dates
 
 
 # =============================================================================
@@ -1030,17 +1053,27 @@ ISSUE_PREFIX_PATTERN = re.compile(r'^(\d{8})_v([A-Za-z0-9]+)_n(\d+)')
 
 def parse_issue_prefix(text):
     """
-    Pull (volume, paper_no) out of the START of a reference string like
-    "18850102_vXI_n39.pdf" or "18850102_vXI_n39" - used for "Old Method"
-    Town List files, whose first column names the issue by filename
-    (with no page number, and often a .pdf extension) rather than a
-    bare paper number. Returns None if it doesn't look like one of these.
+    Pull (date_iso, volume, paper_no) out of the START of a reference
+    string like "18850102_vXI_n39.pdf" or "18850102_vXI_n39" - used for
+    "Old Method" Town List files, whose first column (or, for the
+    filename-only layout, its paper-number column) names the issue by
+    filename rather than a bare paper number. Returns None if it
+    doesn't look like one of these.
+
+    date_iso is "YYYY-MM-DD" when the embedded date is a real calendar
+    date, or the raw 8-digit text unchanged otherwise (same fallback
+    parse_tiff_filename uses) - callers that only care about volume/
+    paper_no (the original use of this function) can ignore it.
     """
     match = ISSUE_PREFIX_PATTERN.match(text.strip())
     if not match:
         return None
-    _, volume_raw, paper_no_text = match.groups()
-    return normalize_volume(volume_raw), int(paper_no_text)
+    date_text, volume_raw, paper_no_text = match.groups()
+    try:
+        date_iso = datetime.strptime(date_text, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        date_iso = date_text
+    return date_iso, normalize_volume(volume_raw), int(paper_no_text)
 
 
 def volume_from_town_list_filename(filename):
@@ -1622,17 +1655,20 @@ def gather_all_records(waiting_dir):
     filename reference column).
 
     Returns (records, problems, tiff_filenames, townlist_filenames,
-    file_usable_counts, file_pending). file_usable_counts maps each
-    input filename to how many entries it contributed that were
-    successfully parsed (used, together with file_pending, to decide
-    whether a file is safe to move into DataFilesCompleted - see
-    move_processed_input_files()). file_pending is the set of filenames
-    that still have at least one entry NOT yet written to the ingest
-    file - waiting on a matching tifflist or Town List entry that
-    hasn't shown up yet (or, for a tifflist, an invalid date that needs
-    a manual fix) - so the file stays visible in DataWaiting and gets
-    automatically retried on a future run instead of being moved away
-    and having that data effectively lost.
+    file_usable_counts, file_pending, year_to_filenames, corrections).
+    file_usable_counts maps each input filename to how many entries it
+    contributed that were successfully parsed (used, together with
+    file_pending, to decide whether a file is safe to move into
+    DataFilesCompleted - see move_processed_input_files()).
+    file_pending is the set of filenames that still have at least one
+    entry NOT yet written to the ingest file - waiting on a matching
+    tifflist or Town List entry that hasn't shown up yet (or, for a
+    tifflist, an invalid date that couldn't be auto-corrected and
+    needs a manual fix) - so the file stays visible in DataWaiting and
+    gets automatically retried on a future run instead of being moved
+    away and having that data effectively lost. corrections lists any
+    invalid dates that WERE confidently auto-corrected and written
+    normally this run - see attempt_date_correction.
     """
     tiff_filenames = find_tiff_source_files(waiting_dir)
     townlist_filenames = find_town_list_source_files(waiting_dir)
@@ -1688,12 +1724,13 @@ def gather_all_records(waiting_dir):
 
     # ---- Read every Town List file into one combined pool ---------------
     all_town_lists = {}
+    all_town_dates = {}
     for filename in townlist_filenames:
         path = os.path.join(waiting_dir, filename)
         print(f"Reading Town List: {filename}")
         try:
             grid = read_grid(path)
-            raw_town_list = parse_town_list(grid)
+            raw_town_list, raw_town_dates = parse_town_list(grid)
             resolved, resolve_problems = resolve_town_list_volumes(
                 raw_town_list, all_tiff_issues, filename_hint=filename
             )
@@ -1721,13 +1758,18 @@ def gather_all_records(waiting_dir):
                 continue
             all_town_lists[key] = towns
             town_key_source[key] = filename
+            if key in raw_town_dates:
+                all_town_dates[key] = raw_town_dates[key]
 
     source_label = (
         f"{len(tiff_filenames)} tifflist file(s)" if tiff_filenames
         else "no tifflist files found"
     )
-    records, join_problems, pending_tiff_keys, pending_town_keys = records_from_single_source(
-        all_tiff_issues, all_town_lists, [], source_label=source_label,
+    records, join_problems, pending_tiff_keys, pending_town_keys, corrections = (
+        records_from_single_source(
+            all_tiff_issues, all_town_lists, [], source_label=source_label,
+            town_dates=all_town_dates,
+        )
     )
     all_problems.extend(join_problems)
 
@@ -1751,7 +1793,7 @@ def gather_all_records(waiting_dir):
                 year_to_filenames.setdefault(record["year"], set()).add(src)
 
     return (records, all_problems, tiff_filenames, townlist_filenames,
-            file_usable_counts, file_pending, year_to_filenames)
+            file_usable_counts, file_pending, year_to_filenames, corrections)
 
 
 # =============================================================================
@@ -1917,8 +1959,100 @@ def make_year_ingest_filename(directory, year, taken_names):
     return candidate
 
 
+
+# =============================================================================
+# AUTO-CORRECTING AN INVALID TIFF-FILENAME DATE
+# =============================================================================
+# A date like "19110231" (there's no such day as Feb 31) is almost
+# always a typo made when the issue was scanned/named, not a real
+# ambiguity - the newspaper really did come out on some specific day,
+# and its immediate neighbors in the same volume (paper_no - 1 and
+# paper_no + 1) usually pin down exactly which one. We only ever act
+# when one of two narrow, confident patterns applies; anything else is
+# left as a plain invalid_date problem for a person to look at, same
+# as before this existed.
+# =============================================================================
+
+# How far apart the two neighboring issues' dates are allowed to be
+# before we stop trusting a midpoint guess between them. 60 days is
+# generous for a weekly paper (even several skipped issues in a row)
+# while still ruling out a wild guess across some much bigger gap.
+MAX_DATE_CORRECTION_GAP_DAYS = 60
+
+
+def parse_iso_date_or_none(date_text):
+    """
+    datetime, or None if date_text isn't a valid "YYYY-MM-DD" string.
+    Used to recognize a neighboring issue whose OWN date is itself
+    unresolved/invalid, so it can't be trusted as an anchor either.
+    """
+    try:
+        return datetime.strptime(date_text, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def attempt_date_correction(key, issue, tiff_issues):
+    """
+    Try to work out the real date behind an issue whose TIFF filename
+    date didn't parse (issue["date"] is the raw, invalid "YYYYMMDD"
+    text - see parse_tiff_filename). Looks at the immediately adjacent
+    paper numbers in the SAME volume (paper_no - 1 and paper_no + 1) -
+    if both exist and have their own ordinary valid dates, tries:
+
+      1. Weekly midpoint - the bad issue's date is exactly halfway
+         between its neighbors (e.g. neighbors 14 days apart, with the
+         bad one presumably the missing issue in between -> the
+         midpoint is 7 days after the earlier one). This is the
+         common case for a weekly paper with one mis-dated issue.
+      2. Transposed month/day - swapping the month and day digits in
+         the bad date text happens to produce a valid date that falls
+         strictly between the two neighboring dates.
+
+    Returns (corrected_date_iso, method_label) if confident, or
+    (None, None) if neither pattern applies - in which case the issue
+    is left as an ordinary invalid_date problem, completely unchanged.
+    """
+    volume, paper_no = key
+    prev_issue = tiff_issues.get((volume, paper_no - 1))
+    next_issue = tiff_issues.get((volume, paper_no + 1))
+    if not prev_issue or not next_issue:
+        return None, None
+
+    prev_date = parse_iso_date_or_none(prev_issue["date"])
+    next_date = parse_iso_date_or_none(next_issue["date"])
+    if not prev_date or not next_date or next_date <= prev_date:
+        return None, None
+
+    gap_days = (next_date - prev_date).days
+    if gap_days > MAX_DATE_CORRECTION_GAP_DAYS:
+        return None, None
+
+    # Pattern 1: weekly midpoint.
+    if gap_days % 2 == 0:
+        midpoint = prev_date + timedelta(days=gap_days // 2)
+        return midpoint.strftime("%Y-%m-%d"), "weekly midpoint"
+
+    # Pattern 2: transposed month/day digits (e.g. "19110231" with
+    # month "02"/day "31" swapped to month "31"/day "02" - this
+    # particular example doesn't work since "31" isn't a real month,
+    # but a different bad date might transpose into a real one).
+    bad_text = issue["date"]
+    if len(bad_text) == 8 and bad_text.isdigit():
+        year_text, month_text, day_text = bad_text[:4], bad_text[4:6], bad_text[6:8]
+        swapped_text = f"{year_text}{day_text}{month_text}"
+        try:
+            swapped_date = datetime.strptime(swapped_text, "%Y%m%d")
+        except ValueError:
+            swapped_date = None
+        if swapped_date and prev_date < swapped_date < next_date:
+            return swapped_date.strftime("%Y-%m-%d"), "transposed month/day"
+
+    return None, None
+
+
 def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
-                                source_label, problem_prefix=""):
+                                source_label, problem_prefix="", town_dates=None):
     """
     Turn one already-read (tiff_issues, town_lists) pair into a list of
     issue records plus a list of human-readable problem descriptions
@@ -1943,17 +2077,33 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     so problems from multiple sources can be told apart in one report;
     leave it blank when there's only a single source.
 
-    Returns (records, problems, pending_tiff_keys, pending_town_keys).
-    pending_tiff_keys / pending_town_keys are the (volume, paper_no)
-    keys that didn't make it into a record, split by which SIDE still
-    needs attention - used by gather_all_records() to figure out which
-    specific input file(s) should stay in DataWaiting rather than move
-    to DataFilesCompleted, since their data isn't fully used yet.
+    town_dates - optional dict[(volume, paper_no)] -> date_iso (see
+    parse_town_list), used to add a date onto a missing_tiffs problem
+    line when one is available, so the merge report/alert email can
+    group those by year too (see group_problems). This does NOT make
+    missing_tiffs start holding years back, even though a year can now
+    be read out of it - see PROBLEM_CATEGORIES_NEVER_BLOCK in
+    merge_and_write_records: "waiting on a tiff that hasn't arrived
+    yet" stays the normal, non-blocking state it always was.
+
+    Returns (records, problems, pending_tiff_keys, pending_town_keys,
+    corrections). pending_tiff_keys / pending_town_keys are the
+    (volume, paper_no) keys that didn't make it into a record, split
+    by which SIDE still needs attention - used by gather_all_records()
+    to figure out which specific input file(s) should stay in
+    DataWaiting rather than move to DataFilesCompleted, since their
+    data isn't fully used yet. corrections is a list of human-readable
+    notes, one per issue whose invalid date was confidently
+    auto-corrected (see attempt_date_correction) and written through
+    normally this run - reported in the merge report/alert email for
+    visibility, but never held back or treated as a problem.
     """
     records = []
     problems = []
+    corrections = []
     pending_tiff_keys = set()
     pending_town_keys = set()
+    town_dates = town_dates or {}
 
     town_keys = set(town_lists.keys())
     tiff_keys = set(tiff_issues.keys())
@@ -1962,9 +2112,27 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
 
     for key in sorted(only_in_town_list):
         volume, paper_no = key
+        # A date for this row (from the Town List's own filename column,
+        # when it has one - see parse_town_list) lets the report/email
+        # group these by year like everything else, even though a
+        # missing_tiffs problem never holds a year back on its own.
+        date_iso = town_dates.get(key)
+        if date_iso and parse_iso_date_or_none(date_iso):
+            # The raw "YYYYMMDD" digits (not the human-readable date)
+            # are what extract_year_from_problem's regex actually
+            # looks for - see PROBLEM_YEAR_PATTERN - so both forms go
+            # in: the digits for the report/email to group this by
+            # year (see group_problems), and the readable date for a
+            # person skimming the raw problem text.
+            raw_digits = date_iso.replace("-", "")
+            dated = f" dated {raw_digits} ({format_date_long(date_iso)})"
+        elif date_iso:
+            dated = f" dated '{date_iso}'"  # couldn't parse - show raw text
+        else:
+            dated = ""
         problems.append(
             f"{problem_prefix}[missing_tiffs] Town List has Vol_{volume} "
-            f"paper #{paper_no} with towns "
+            f"paper #{paper_no}{dated} with towns "
             f"({MULTI_SEP.join(town_lists[key])}), but no matching TIFF "
             f"has been found in {source_label} yet - not added to the "
             f"ingest file; will be picked up automatically once a "
@@ -1984,19 +2152,48 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
         except ValueError:
             # issue["date"] didn't parse as a real calendar date (e.g. a
             # TIFF filename with a typo'd date like "19110231" - no such
-            # thing as Feb 31). Rather than crashing the whole run, skip
-            # just this one issue and flag it for review - same pattern
-            # as missing_tiffs/missing_town_list/unrecognized_filename
-            # below. Once the source filename/date is corrected, a later
-            # run will pick the issue up normally (nothing was written
-            # for it, so there's no existing row to reconcile).
-            problems.append(
-                f"{problem_prefix}[invalid_date] Issue {issue['issue_id']} "
-                f"has an invalid date ('{issue['date']}') and was skipped - "
-                f"check the source TIFF filename(s) for a typo."
+            # thing as Feb 31). Before giving up, see if the surrounding
+            # issues let us confidently work out what the real date was
+            # (see attempt_date_correction) - if so, fix it up and fall
+            # through to write the issue normally, same as any other
+            # issue. Otherwise, same as before: skip just this one issue
+            # and flag it for review, rather than crashing the whole run.
+            # Once the source filename/date is corrected by hand, a
+            # later run will pick the issue up normally (nothing was
+            # written for it, so there's no existing row to reconcile).
+            original_date = issue["date"]
+            corrected_date, method = attempt_date_correction(key, issue, tiff_issues)
+            if corrected_date is None:
+                problems.append(
+                    f"{problem_prefix}[invalid_date] Issue {issue['issue_id']} "
+                    f"has an invalid date ('{original_date}') and was "
+                    f"skipped - check the source TIFF filename(s) for a typo."
+                )
+                pending_tiff_keys.add(key)
+                continue
+
+            corrected_issue = dict(issue, date=corrected_date)
+            try:
+                record = compute_issue_record(key, corrected_issue, town_lists)
+            except ValueError:
+                # Shouldn't happen (corrected_date is always a real
+                # calendar date), but don't let a surprise here crash
+                # the run - fall back to reporting it as an ordinary
+                # invalid_date problem instead.
+                problems.append(
+                    f"{problem_prefix}[invalid_date] Issue {issue['issue_id']} "
+                    f"has an invalid date ('{original_date}') and was "
+                    f"skipped - check the source TIFF filename(s) for a typo."
+                )
+                pending_tiff_keys.add(key)
+                continue
+
+            corrections.append(
+                f"{problem_prefix}Issue {issue['issue_id']} had an invalid "
+                f"date ('{original_date}') - corrected to {corrected_date} "
+                f"based on the surrounding issues ({method}) and written "
+                f"normally."
             )
-            pending_tiff_keys.add(key)
-            continue
 
         if key in only_in_tiffs:
             problems.append(
@@ -2012,7 +2209,7 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
         record["_join_key"] = key  # internal use only - see gather_all_records
         records.append(record)
 
-    return records, problems, pending_tiff_keys, pending_town_keys
+    return records, problems, pending_tiff_keys, pending_town_keys, corrections
 
 
 LOGS_SUBDIR_NAME = "_Logs"
@@ -2220,6 +2417,15 @@ PROBLEM_CATEGORY_VERBATIM = {"file_read_error", "unrecognized_filename"}
 PROBLEM_CATEGORY_PATTERN = re.compile(r'\[(\w+)\]')
 INVALID_DATE_VALUE_PATTERN = re.compile(r"invalid date \('([^']+)'\)")
 
+# Categories that are allowed to show a year (for report/email grouping
+# - see group_problems) WITHOUT that year being held back by the
+# circuit breaker in merge_and_write_records. "Waiting on a tiff/Town
+# List match that hasn't shown up yet" is a normal, expected, transient
+# state while contributor files trickle in over time - not an error -
+# so it should never block a year on its own, even once we can tell
+# which year it belongs to.
+PROBLEM_CATEGORIES_NEVER_BLOCK = {"missing_tiffs", "unrecognized_filename"}
+
 
 def group_problems(problems):
     """
@@ -2316,21 +2522,26 @@ def format_problem_summary_lines(problems, verbatim_as_lines=False):
 
 def build_alert_email(current_problems, resolved_problems, blocked_years,
                        new_summary_by_year, report_path, waiting_subdir,
-                       ingest_dir_label, source_line):
+                       ingest_dir_label, source_line, corrections=()):
     """
     Builds the (subject, body) for the alert email sent whenever this
-    run's problem picture changed from last run's - see
-    merge_and_write_records(). Unlike the full merge report (one line
-    per issue), this stays short: one line per year summing up how many
-    problems of each kind it has, one line per category of problem that
-    isn't tied to a year yet, and the handful of genuinely one-off
-    problems (see PROBLEM_CATEGORY_VERBATIM) printed out in full for
-    CURRENT problems only - resolved problems get the same by-year/
+    run's problem picture changed from last run's, or a date got
+    auto-corrected - see merge_and_write_records(). Unlike the full
+    merge report (one line per issue), this stays short: one line per
+    year summing up how many problems of each kind it has, one line
+    per category of problem that isn't tied to a year yet, and the
+    handful of genuinely one-off problems (see
+    PROBLEM_CATEGORY_VERBATIM) printed out in full for CURRENT
+    problems only - resolved problems get the same by-year/
     by-category counts but no verbatim text, since what matters there
     is just that they're gone.
 
     new_summary_by_year - {year: {count, pages, min_date, max_date}} for
     issues actually written this run (see merge_and_write_records).
+    corrections - human-readable notes about any invalid dates that
+    were confidently auto-corrected and written normally this run
+    (see attempt_date_correction) - printed in full, since there are
+    usually very few of these and the specifics are worth seeing.
     """
     lines = [
         f"Run at: {format_eastern_timestamp()}",
@@ -2402,6 +2613,12 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
         lines.extend(resolved_summary)
         lines.append("")
 
+    if corrections:
+        noun = "date" if len(corrections) == 1 else "dates"
+        lines.append(f"Auto-corrected {noun} this run:")
+        lines.extend(f"  - {c}" for c in corrections)
+        lines.append("")
+
     if report_path:
         lines.append(f"Full report: {report_path}")
 
@@ -2410,6 +2627,9 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
         subject = f"Newspaper pipeline: {len(blocked_years)} {noun} held back"
     elif current_problems:
         subject = "Newspaper pipeline: problems to review (nothing held back)"
+    elif corrections:
+        noun = "date" if len(corrections) == 1 else "dates"
+        subject = f"Newspaper pipeline: all clear ({len(corrections)} {noun} auto-corrected)"
     else:
         subject = "Newspaper pipeline: all clear"
 
@@ -2417,7 +2637,7 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
 
 
 def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
-                             volume_problems, source_line):
+                             volume_problems, source_line, corrections=()):
     """
     The shared merge/dedup/write engine, used by BOTH the default
     directory-scanning mode and manual single-pair mode.
@@ -2454,6 +2674,10 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     volume_problems  - problem description strings (missing_tiffs etc.)
     source_line       - one line of text for the report describing where
                         all_records came from
+    corrections       - human-readable notes about any invalid dates
+                        that were confidently auto-corrected and
+                        written normally this run (see
+                        attempt_date_correction / records_from_single_source)
 
     In manual single-pair mode, log_root, ingest_dir, and reports_dir
     are all the same folder - see main() - preserving that mode's
@@ -2465,10 +2689,15 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     DataWaiting instead of moving them to DataFilesCompleted.
     """
     current_problems = set(volume_problems)
-    blocked_years = {
-        year for p in current_problems
-        for year in [extract_year_from_problem(p)] if year
-    }
+    blocked_years = set()
+    for p in current_problems:
+        category_match = PROBLEM_CATEGORY_PATTERN.search(p)
+        category = category_match.group(1) if category_match else None
+        if category in PROBLEM_CATEGORIES_NEVER_BLOCK:
+            continue
+        year = extract_year_from_problem(p)
+        if year:
+            blocked_years.add(year)
 
     records_by_year = {}
     for record in all_records:
@@ -2626,7 +2855,10 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # on-demand - most runs genuinely have nothing new to say.
     previous_problems = read_last_problems(log_root)
     problems_changed = current_problems != previous_problems
-    noteworthy = bool(added_total) or bool(mismatch_lines) or problems_changed
+    noteworthy = (
+        bool(added_total) or bool(mismatch_lines) or problems_changed
+        or bool(corrections)
+    )
 
     report_path = None
     if noteworthy:
@@ -2673,6 +2905,11 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
                 lines.append(f"  - {year}: {held_back_counts[year]} issue(s) waiting")
             lines.append("")
 
+        if corrections:
+            lines.append("DATES AUTO-CORRECTED THIS RUN:")
+            lines.extend(f"  - {c}" for c in corrections)
+            lines.append("")
+
         if mismatch_lines:
             lines.append("DUPLICATES WITH DIFFERING DATA:")
             lines.extend(mismatch_lines)
@@ -2696,7 +2933,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # used for "noteworthy" above, so an unattended schedule running 5x
     # a day doesn't send the same email about the same unresolved issue
     # over and over.
-    if problems_changed:
+    if problems_changed or corrections:
         resolved_problems = previous_problems - current_problems
         report_label = (
             f"/{MERGE_REPORTS_SUBDIR}/{os.path.basename(report_path)}"
@@ -2709,7 +2946,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         subject, body = build_alert_email(
             current_problems, resolved_problems, blocked_years,
             new_summary_by_year, report_label, DATA_WAITING_SUBDIR,
-            ingest_dir_label, source_line,
+            ingest_dir_label, source_line, corrections,
         )
         send_error_email(subject, body)
 
@@ -2769,7 +3006,7 @@ def run_by_year(directory):
 
     print(f"Scanning {waiting_dir} for tifflist and Town List files...")
     (all_records, problems, tiff_filenames, townlist_filenames,
-     file_usable_counts, file_pending, year_to_filenames) = (
+     file_usable_counts, file_pending, year_to_filenames, corrections) = (
         gather_all_records(waiting_dir)
     )
 
@@ -2787,7 +3024,8 @@ def run_by_year(directory):
         f"Town List files read: {', '.join(townlist_filenames) or '(none)'}"
     )
     blocked_years = merge_and_write_records(
-        directory, ingest_dir, reports_dir, all_records, problems, source_line
+        directory, ingest_dir, reports_dir, all_records, problems, source_line,
+        corrections,
     )
 
     # A file whose records all matched fine, but whose YEAR got held
@@ -2890,15 +3128,18 @@ def main():
 
     print(f"Reading Town List: {townlist_file}")
     grid = read_grid(townlist_file)
-    raw_town_lists = parse_town_list(grid)
+    raw_town_lists, town_dates = parse_town_list(grid)
     town_lists, resolve_problems = resolve_town_list_volumes(
         raw_town_lists, tiff_issues, filename_hint=os.path.basename(townlist_file)
     )
     print(f"  Found {len(town_lists)} issue(s) in the Town List.")
 
     print("Merging into output files...")
-    records, problems, _pending_tiff, _pending_town = records_from_single_source(
-        tiff_issues, town_lists, unrecognized_items, source_label=source_label,
+    records, problems, _pending_tiff, _pending_town, corrections = (
+        records_from_single_source(
+            tiff_issues, town_lists, unrecognized_items, source_label=source_label,
+            town_dates=town_dates,
+        )
     )
     problems.extend(f"[{townlist_file}] {p}" for p in resolve_problems)
     source_line = f"Source: {tiff_source} + {townlist_file}"
@@ -2906,7 +3147,7 @@ def main():
     # everything reads from and writes back to output_dir, same as
     # before the four-folder layout existed.
     merge_and_write_records(output_dir, output_dir, output_dir, records,
-                             problems, source_line)
+                             problems, source_line, corrections)
 
 
 if __name__ == "__main__":
