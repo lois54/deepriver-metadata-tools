@@ -1641,7 +1641,7 @@ def resolve_town_list_volumes(town_lists, tiff_issues, filename_hint=None):
     return resolved, problems
 
 
-def gather_all_records(waiting_dir):
+def gather_all_records(waiting_dir, already_ingested_keys=None):
     """
     Read EVERY recognized tifflist file and EVERY recognized Town List
     file in `waiting_dir` (the DataWaiting folder) - regardless of how
@@ -1653,6 +1653,12 @@ def gather_all_records(waiting_dir):
     XI and Vol. XII) match correctly against a Town List using either
     the plain "No." format or the "Old Method" format (a per-row
     filename reference column).
+
+    already_ingested_keys - see records_from_single_source; passed
+    straight through so a Town List entry already written in an
+    earlier run doesn't get re-reported as missing_tiffs forever just
+    because its tifflist has since moved out of DataWaiting while a
+    larger, multi-volume Town List file is still sitting there.
 
     Returns (records, problems, tiff_filenames, townlist_filenames,
     file_usable_counts, file_pending, year_to_filenames, corrections).
@@ -1768,7 +1774,7 @@ def gather_all_records(waiting_dir):
     records, join_problems, pending_tiff_keys, pending_town_keys, corrections = (
         records_from_single_source(
             all_tiff_issues, all_town_lists, [], source_label=source_label,
-            town_dates=all_town_dates,
+            town_dates=all_town_dates, already_ingested_keys=already_ingested_keys,
         )
     )
     all_problems.extend(join_problems)
@@ -1948,6 +1954,49 @@ def find_year_ingest_files(directory):
     return files
 
 
+def scan_existing_issue_keys(ingest_dir):
+    """
+    Scan every IngestFiles/<year>/ folder under ingest_dir and collect
+    the (volume, paper_no) key for every issue already written to an
+    ingest CSV there (parsed back out of each parent row's
+    local_identifier - see build_parent_row_dict - with the same
+    parse_issue_prefix() used for Town List filename references).
+
+    This exists to recognize when a Town List entry with no TIFF match
+    in THIS run's DataWaiting scan was actually already matched and
+    ingested in an EARLIER run - typically because its tifflist file
+    has since been moved to DataFilesCompleted (fully used, so it's
+    gone from this run's scan), while its Town List file is a larger,
+    multi-volume master list that's still sitting in DataWaiting with
+    rows for plenty of other issues too. Without this check, that
+    Town List file would make the pipeline re-report those
+    already-ingested issues as "missing_tiffs" forever, run after run,
+    even though nothing is actually missing - see
+    records_from_single_source.
+    """
+    keys = set()
+    if not os.path.isdir(ingest_dir):
+        return keys
+
+    for year in os.listdir(ingest_dir):
+        year_dir = os.path.join(ingest_dir, year)
+        if not os.path.isdir(year_dir):
+            continue
+        for file_info in find_year_ingest_files(year_dir):
+            for row in file_info["rows"]:
+                if row.get("model") != "Publication Issue":
+                    continue
+                issue_id = (row.get("local_identifier") or "").strip()
+                if not issue_id:
+                    continue
+                parsed = parse_issue_prefix(issue_id)
+                if parsed:
+                    _, volume, paper_no = parsed
+                    keys.add((volume, paper_no))
+
+    return keys
+
+
 def make_year_ingest_filename(directory, year, taken_names):
     """Build a "<year>-ingest.csv" filename for one year folder, adding
     a "_partN" suffix only if that name is already taken."""
@@ -2052,7 +2101,8 @@ def attempt_date_correction(key, issue, tiff_issues):
 
 
 def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
-                                source_label, problem_prefix="", town_dates=None):
+                                source_label, problem_prefix="", town_dates=None,
+                                already_ingested_keys=None):
     """
     Turn one already-read (tiff_issues, town_lists) pair into a list of
     issue records plus a list of human-readable problem descriptions
@@ -2086,6 +2136,19 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     merge_and_write_records: "waiting on a tiff that hasn't arrived
     yet" stays the normal, non-blocking state it always was.
 
+    already_ingested_keys - optional set of (volume, paper_no) already
+    written to an ingest CSV in an EARLIER run (see
+    scan_existing_issue_keys). A Town List entry matching one of these
+    is skipped entirely here - no missing_tiffs problem, and not added
+    to pending_town_keys - because it isn't actually missing anything;
+    its tifflist file has simply already been fully used and moved out
+    of DataWaiting, while a larger, multi-volume Town List file with
+    plenty of other rows is still sitting there. Without this, that
+    Town List file would make the pipeline re-report an already-
+    ingested issue as "missing_tiffs" on every single run forever, and
+    would never be recognized as fully used (so it'd never move to
+    DataFilesCompleted either).
+
     Returns (records, problems, pending_tiff_keys, pending_town_keys,
     corrections). pending_tiff_keys / pending_town_keys are the
     (volume, paper_no) keys that didn't make it into a record, split
@@ -2104,6 +2167,7 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     pending_tiff_keys = set()
     pending_town_keys = set()
     town_dates = town_dates or {}
+    already_ingested_keys = already_ingested_keys or set()
 
     town_keys = set(town_lists.keys())
     tiff_keys = set(tiff_issues.keys())
@@ -2111,6 +2175,13 @@ def records_from_single_source(tiff_issues, town_lists, unrecognized_items,
     only_in_tiffs = tiff_keys - town_keys
 
     for key in sorted(only_in_town_list):
+        if key in already_ingested_keys:
+            # Already written to the ingest file in an earlier run -
+            # this Town List row isn't missing anything, its tifflist
+            # has just since moved on. See
+            # scan_existing_issue_keys/already_ingested_keys above.
+            continue
+
         volume, paper_no = key
         # A date for this row (from the Town List's own filename column,
         # when it has one - see parse_town_list) lets the report/email
@@ -3004,10 +3075,18 @@ def run_by_year(directory):
     ingest_dir = ensure_subdir(directory, INGEST_FILES_SUBDIR)
     reports_dir = ensure_subdir(directory, MERGE_REPORTS_SUBDIR)
 
+    # What's already been written in an EARLIER run, across every year
+    # - see scan_existing_issue_keys/already_ingested_keys. This keeps
+    # a Town List entry whose matching tifflist has since moved out of
+    # DataWaiting (fully used already) from being re-reported as
+    # missing_tiffs forever, just because a larger, multi-volume Town
+    # List file with other still-pending rows is still sitting there.
+    already_ingested_keys = scan_existing_issue_keys(ingest_dir)
+
     print(f"Scanning {waiting_dir} for tifflist and Town List files...")
     (all_records, problems, tiff_filenames, townlist_filenames,
      file_usable_counts, file_pending, year_to_filenames, corrections) = (
-        gather_all_records(waiting_dir)
+        gather_all_records(waiting_dir, already_ingested_keys=already_ingested_keys)
     )
 
     if not tiff_filenames and not townlist_filenames:
@@ -3139,6 +3218,7 @@ def main():
         records_from_single_source(
             tiff_issues, town_lists, unrecognized_items, source_label=source_label,
             town_dates=town_dates,
+            already_ingested_keys=scan_existing_issue_keys(output_dir),
         )
     )
     problems.extend(f"[{townlist_file}] {p}" for p in resolve_problems)
