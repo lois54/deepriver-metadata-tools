@@ -2,7 +2,8 @@
 # =============================================================================
 # BUILD ISSUE CSV
 # =============================================================================
-# Generated: 2026-10-17 02:05 PM EDT
+# Generated: 2026-10-17 10:07 PM EDT
+# Last modified: 2026-10-17 10:07 PM EDT (alert email says "No issues added this run" when nothing new)
 #
 # WHAT THIS SCRIPT DOES
 # ----------------------------------------------------------------------------
@@ -2632,7 +2633,7 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
             )
             lines.append(f"  {year}: {s['count']} {noun} ({s['pages']} pages), {date_range}")
     else:
-        lines.append("New issues added: none this run")
+        lines.append("No issues added this run")
     lines.append("")
 
     by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts = (
