@@ -1,112 +1,103 @@
-# Deep River Metadata Tools
+# Deep River New Era ingest pipeline
 
-Tools for digitizing and cataloging historical issues of the *Deep River
-New Era*, a Connecticut newspaper, for ingest into an Islandora-based
-digital repository. This project is a collaboration between the Deep
-River Public Library, Chester Historical Society, Westbrook Historical
-Society, and Deep River Historical Society.
+This pipeline turns scan lists (TIFF filenames) and Town List spreadsheets for the *Deep River New Era* into per-year CSV files that the library's repository ingest can load. Each run reads the input folder, matches each issue's pages to its towns, adds any new issues to the year files, and reports anything that needs a human look.
 
-[Islandora](https://islandora.ca/) is an open-source digital repository
-platform commonly used by libraries and archives to host and catalog
-digitized materials. "Islandora-compatible," used below, means the CSV
-files this project produces follow the exact column layout and
-formatting Islandora requires for a bulk import to succeed.
+The code is split across a short entry point and a package:
 
-## What's in this repo
+```
+build_issue_csv.py          entry point (run this)
+newspaper_ingest/           the pipeline code (16 modules)
+notes_config.txt            the credits text used in every issue's notes field
+run_from_drive.py           calls build_issue_csv.py (unchanged)
+README.md                   this file
+docs/BEHAVIOR.md            what the pipeline does in every situation
+docs/CODE.md                reference for the code itself
+```
 
-- **`build_issue_csv.py`** — the core script. Reads TIFF scan listings
-  ("tifflist" files) and town/subject metadata ("Town List" files) out
-  of a `DataWaiting` folder, matches them up, and produces
-  Islandora-compatible ingest CSVs in `IngestFiles`. It's idempotent:
-  re-running it against the same data never duplicates or silently
-  overwrites previously reviewed issues. Changed data on an
-  already-processed issue gets flagged for human review rather than
-  overwritten automatically. Input files that were successfully
-  processed are moved automatically into `DataFilesCompleted`; a run
-  report goes to `MergeReports` whenever something new or noteworthy
-  happens. See the script's own header comment for the full breakdown
-  of this four-folder layout.
+## Quick start
 
-- **`check_duplicates.py`** — runs before `build_issue_csv.py`. Checks
-  every file in `DataWaiting` for duplicate entries *within* that one
-  file (the same TIFF filename listed twice, or the same paper number
-  on two rows). If it finds any, it moves the original file into
-  `DataFilesCompleted` tagged `-has_duplicates`, and leaves a corrected
-  copy behind under the original name for `build_issue_csv.py` to pick
-  up normally.
+1. Put the tifflist files and Town List files into `DataWaiting/`.
+2. Run:
+   ```
+   python build_issue_csv.py <root_folder>
+   ```
+3. Look in `IngestFiles/<year>/` for the new CSVs (and matching `.xlsx` copies), and in `MergeReports/` for the run report.
 
-- **`notes_config.txt`** — a plain text file listing the contributor
-  credits attached to every issue. Editing this file is how credits get
-  added or changed; no code changes needed.
+Re-running is safe. Issues already written are recognized and left alone.
 
-- **`run_from_drive.py`** — a wrapper that lets `check_duplicates.py`
-  and `build_issue_csv.py` run automatically on a schedule via GitHub
-  Actions, even though GitHub's servers have no Google Drive folder of
-  their own. It downloads each of the managed Drive subfolders
-  (`DataWaiting`, `DataFilesCompleted`, `IngestFiles`, `MergeReports`,
-  `_Logs`) into a temporary folder, runs both scripts against them
-  exactly as they'd run locally, then uploads back whatever's new,
-  changed, or moved.
+## Folder layout
 
-- **`.github/workflows/issue-builder-schedule.yml`** — the schedule
-  definition: runs five times a day (9:07am, 12:07pm, 3:07pm, 6:07pm,
-  and 9:07pm Eastern).
+The root folder holds these subfolders. They are created automatically the first time the script runs.
 
-## Where the actual data lives
+| Folder | What it holds |
+|---|---|
+| `DataWaiting/` | Input. Tifflist and Town List files go here. |
+| `DataFilesCompleted/` | Input files moved here once everything in them has been used. |
+| `IngestFiles/<year>/` | Output. One folder per year, containing `<year>-ingest.csv` (or `<year>-ingest_partN.csv` when a year grows large) and a matching `.xlsx` copy of each CSV. |
+| `MergeReports/` | `Ingest_merge_report_<timestamp>.txt`. Written only when the run added something, found a difference, or the set of problems changed. |
+| `_Logs/` | `run_log.txt`, one line per run. `last_problems.txt`, the problem list from the previous run, used to decide whether anything changed. Do not edit. |
 
-**Not here.** All scan listings, metadata, and generated ingest CSVs
-live in a Google Drive folder, not in this repository. This repo
-contains only code and a small, non-sensitive credits file. Nothing
-in this repo, or in any GitHub Actions log it produces, reveals the
-content of the newspaper metadata itself.
+## Input files
 
-## How the automation is secured
+**Tifflist** (lists the scanned pages). Any of these is picked up:
+- a `.txt` or `.csv` whose name ends in `tifflist` (for example `Vol_XI_tifflist.txt`), or
+- any other `.txt` or `.csv` in `DataWaiting/` where at least half the non-blank lines contain a TIFF filename.
 
-This repository is public, since there's nothing sensitive in the code
-itself. Making the automation work safely under that condition relies
-on a few things:
+Each line is either a plain filename, a full path, or a Windows `dir` listing line. Filenames look like:
 
-- **Credentials are never in the code.** The script authenticates to
-  Google Drive using two credentials — a service account (for reading
-  files and updating existing ones) and a narrowly-scoped OAuth
-  credential (for creating brand-new files, working around a Google
-  Drive quirk where service accounts have no storage quota of their
-  own). Both are stored as encrypted [GitHub Actions
-  secrets](https://docs.github.com/en/actions/security-guides/encrypted-secrets),
-  never committed to the repo, never visible in logs, and never
-  exposed even to people who can read the code.
+```
+18850116_vXI_n41_0001.tif
+YYYYMMDD _ vVOLUME _ nPAPERNUMBER _ PAGE .tif
+```
 
-- **Access is scoped to one folder, not the whole Drive.** The service
-  account can only see the single Drive folder it's been explicitly
-  shared on — sharing it with a folder is what grants access, not
-  anything in this code. The OAuth credential is scoped to
-  `drive.file` — limited to files it creates itself — rather than
-  broad access to the account's entire Drive.
+The page part is optional. A filename without one is treated as page 1.
 
-- **Nothing persists on GitHub's servers between runs.** Every
-  scheduled run spins up a brand-new, disposable virtual machine.
-  Downloaded files live only in that machine's temporary storage for
-  the few minutes the job runs, and the whole machine is destroyed
-  afterward. No data file is ever written into the git repository
-  itself.
+**Town List** (lists the towns each issue covers). A `.xlsx` or `.csv` file with "Town List" in its name (for example `Vol_XI_Town_List.xlsx`). Three layouts are recognized automatically:
+- **Format A**: one row per issue, with a `No.` or `Paper No.` column and a `File` column, and towns across the row.
+- **Format B**: paper numbers across the top row, towns stacked down each column.
+- **Format C** ("Slim"): a filename column plus a `Subject` column already filled in as `Newspaper -- Town, CT`.
 
-- **A public repo does not mean anyone can run this against our
-  data.** The workflow only runs on its defined schedule, or via a
-  manual "Run workflow" button that's only visible to people with
-  write access to this repository. Someone could copy this code (fork
-  it) to adapt it for their own Drive folder, but GitHub secrets never
-  travel with a fork — a copy of this workflow run anywhere else would
-  have no credentials and would fail immediately, unable to reach this
-  project's actual data.
+In manual mode the Town List can also be a Google Sheets link. The sheet must be shared as "Anyone with the link can view".
 
-## Maintaining the schedule
+## Setup
 
-`issue-builder-schedule.yml` schedules directly in Eastern time, using
-GitHub Actions' `timezone` field on the cron trigger. GitHub adjusts
-for daylight saving automatically — no manual hour adjustment needed
-twice a year.
+1. **Python 3.9 or newer.**
+2. **`openpyxl`** (`pip install openpyxl`). It is needed for `.xlsx` Town Lists and for writing the `.xlsx` copies, which the pipeline makes for every file it writes.
+3. **`notes_config.txt`** in the repository root, next to `build_issue_csv.py`. One credit per line, as `note type: note text`. Blank lines and lines starting with `#` are ignored. If the file is missing, the script stops before doing anything.
+4. **Alert email (optional).** Set the `EMAIL_APP_PASSWORD` environment variable to a Gmail app password. Without it, alerts are skipped and the run continues. Addresses and sender are set in `newspaper_ingest/config.py` (`EMAIL_SENDER`, `EMAIL_RECIPIENTS`).
 
-## Contributors
+## Commands
 
-Patrick McGlamery, Adrian Nicholls, Sandy Forest, Simon LaPlace,
-AC Proctor, and Lois Blood Bennett.
+```
+python build_issue_csv.py <root_folder>
+python build_issue_csv.py --by-year <root_folder>          # same as above
+
+python build_issue_csv.py <tiff_dir_or_listing> <townlist_file_or_sheet_url>   # manual mode
+```
+
+The first two read everything in `DataWaiting/` and are the normal way to run it. Manual mode handles a one-off pair of files that is not in the folder layout. See `docs/BEHAVIOR.md`, situation 23.
+
+## Where things are configured
+
+| Setting | Where |
+|---|---|
+| Fixed credits, rights statement, held-by, collection ID, column list | `newspaper_ingest/config.py` |
+| Publisher names and the dates they took over | `PUBLISHER_BY_DATE` in `newspaper_ingest/config.py` |
+| Digital file path base on the server | `DIGITAL_FILE_BASE` in `newspaper_ingest/config.py` |
+| Maximum rows per ingest file (default 800) | `TARGET_LINES_PER_FILE` in `newspaper_ingest/config.py` |
+| Gap between years that forces a new file | `MAX_CONTIGUOUS_YEAR_GAP` in `newspaper_ingest/config.py` |
+| How far apart neighbors can be for date correction | `MAX_DATE_CORRECTION_GAP_DAYS` in `newspaper_ingest/config.py` |
+| Notes credits | `notes_config.txt` |
+| Email password | `EMAIL_APP_PASSWORD` environment variable |
+
+## Things to know
+
+- A year with a problem that could be a missing piece is held back as a whole. Its new issues are not written until the problem is fixed. This is deliberate. See `docs/BEHAVIOR.md`.
+- Nothing is lost by a hold-back. Every run rebuilds the picture from the input files, so a held-back issue is picked up as soon as its missing piece appears.
+- Dates in filenames are checked. Some typos are corrected automatically and reported. Others are reported and held back. See `docs/BEHAVIOR.md`, situations 7 and 8.
+- The `.xlsx` copies are regenerated from the CSVs each time a file is written. Edit the CSV, not the `.xlsx`.
+
+## Documentation
+
+- `docs/BEHAVIOR.md`: what happens in each situation, what files move, when emails are sent.
+- `docs/CODE.md`: module-by-module reference for developers.
