@@ -9,6 +9,7 @@ from email.mime.text import MIMEText
 
 from .config import EMAIL_RECIPIENTS, EMAIL_SENDER
 from .problems import (
+    EMAIL_SECTION_LINE_LIMIT,
     PROBLEM_CATEGORY_LABELS,
     cap_lines,
     format_problem_summary_lines,
@@ -21,7 +22,8 @@ from .timeutil import format_date_long, format_eastern_timestamp
 
 def build_alert_email(current_problems, resolved_problems, blocked_years,
                        new_summary_by_year, report_path, waiting_subdir,
-                       ingest_dir_label, source_line, corrections=()):
+                       ingest_dir_label, source_line, corrections=(),
+                       complete_year_notices=()):
     """
     Build (subject, body) for the alert email.
 
@@ -38,6 +40,8 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
     new_summary_by_year - {year: {count, pages, min_date, max_date}} for the
     issues actually written this run.
     corrections - notes on dates that were auto-corrected this run.
+    complete_year_notices - one note per year marked ingest_complete that had
+    new issues found this run (written to a new numbered file).
     """
     lines = [
         f"Run at: {format_eastern_timestamp()}",
@@ -108,12 +112,20 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
         lines.extend(cap_lines([f"  - {c}" for c in corrections], limit=5, noun="corrections"))
         lines.append("")
 
+    if complete_year_notices:
+        lines.append("NEW DATA FOUND FOR YEARS MARKED ingest_complete:")
+        lines.extend(cap_lines([f"  - {n}" for n in complete_year_notices],
+                               limit=EMAIL_SECTION_LINE_LIMIT, noun="more years"))
+        lines.append("")
+
     if report_path:
         lines.append(f"Full report: {report_path}")
 
     if blocked_years:
         noun = "year" if len(blocked_years) == 1 else "years"
         subject = f"Newspaper pipeline: {len(blocked_years)} {noun} held back"
+    elif complete_year_notices:
+        subject = "Newspaper pipeline: new data found for a year marked ingest_complete"
     elif current_problems:
         subject = "Newspaper pipeline: problems to review (nothing held back)"
     elif corrections:

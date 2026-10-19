@@ -68,6 +68,7 @@ Plain constants. No functions.
 - `MAX_DATE_CORRECTION_GAP_DAYS` (60): the widest neighbor gap that date correction will trust.
 - `COLUMNS`: the 64 column names, in the order the repository expects. Changing the order breaks the ingest.
 - Folder and file names: `DATA_WAITING_SUBDIR`, `DATA_COMPLETED_SUBDIR`, `INGEST_FILES_SUBDIR`, `MERGE_REPORTS_SUBDIR`, `LOGS_SUBDIR_NAME`, `RUN_LOG_FILENAME`, `LAST_PROBLEMS_FILENAME`, `LAST_CORRECTIONS_FILENAME`.
+- `INGEST_COMPLETE_MARKER_NAMES`: file names (`ingest_complete`, `ingest_complete.txt`) that mark a year folder as complete. Compared in lower case.
 
 **Note on `PUBLISHER_BY_DATE`.** The list is searched in order. The publisher for a date is the last entry whose effective date is on or before it. Where two publishers' ranges share a year (1903), the later publisher is treated as starting on 1 January of that year. This is an assumption and is marked in the source.
 
@@ -213,11 +214,14 @@ Problem categories the code emits:
 ### `ingest_files.py`
 
 - `find_year_ingest_files(folder)`: every `<year>-ingest*.csv` in a year folder as a list of dicts with `filename`, `path`, `part_num`, and `rows`, sorted by part number.
+- `is_year_marked_complete(year_dir)`: True if the folder holds a file named in `INGEST_COMPLETE_MARKER_NAMES` (any capitalization). The marker is made by a person; no code creates or deletes it, and `YEAR_COUNT_FILENAME_PATTERN` cleanup never matches it.
 - `scan_existing_issue_keys(ingest_dir)`: the `(volume, paper_no)` key of every Publication Issue already in any year folder, read from `local_identifier`. Only year subfolders are read. Files sitting directly in `IngestFiles/` are not.
 - `make_year_ingest_filename(folder, year, taken_names)`: `<year>-ingest.csv`, or `<year>-ingest_partN.csv` when that name is taken.
 - `write_matching_xlsx(csv_path)`: rewrites `<same name>.xlsx` from the CSV. Uses `openpyxl`, imported only here.
-- `count_year_ingest_files(year_dir)`: returns `(issues, pages, lines, per_file)` for the year's CSVs, or `None` if there are none. Issues and pages are counted from the `model` column (`Publication Issue`, `Page`). Lines are counted as the number of newline characters in each file, header included, which matches `wc -l`.
-- `write_year_count_file(year_dir, year)`: makes the folder's count file match the CSVs. The name is `<issues>issues<pages>pages<lines>lines.txt` and the body repeats the numbers in words plus each CSV's line count. It deletes any other file matching `YEAR_COUNT_FILENAME_PATTERN` first, so only one exists, and does not rewrite a file whose content is already right (its modified time stays the same, which matters to `run_from_drive.py`, which uploads by modified time). Returns the file name, or `None` for a folder with no CSVs.
+- `_issue_entry(parent_row)`: `(date_iso, volume, paper_no)` for one Publication Issue row. The date is `date_created` from `origin_information`, which is the corrected date when a filename date was auto-corrected. `local_identifier` carries the raw filename date, so it is only a fallback for the date, and is the source of the volume and number.
+- `_format_issue_line(date_iso, volume, paper_no, page_count)`: one line of the issue list, such as `1885-01-02  Vol. XI No. 39  4 pages`.
+- `count_year_ingest_files(year_dir)`: returns a dict for the year's CSVs, or `None` if there are none. Keys: `issues`, `pages`, `lines`, `per_file` (a list of `(filename, lines)`), and `issue_list` (one `(date_iso, volume, paper_no, page_count)` per issue, sorted by date). Issues and pages are counted from the `model` column (`Publication Issue`, `Page`). A Page row is matched to its issue through `member_of`, within the same file, because IDs restart at 1 in each part file. Lines are counted as the number of newline characters in each file, header included, which matches `wc -l`.
+- `write_year_count_file(year_dir, year)`: makes the folder's count file match the CSVs. The name is `<issues>issues<pages>pages<lines>lines.txt`. The body repeats the numbers in words, lists each CSV's line count, and then lists every issue, one per line. The file is rewritten whenever its content differs, so it is also refreshed when the list changes but the counts do not. It deletes any other file matching `YEAR_COUNT_FILENAME_PATTERN` first, so only one exists, and does not rewrite a file whose content is already right (its modified time stays the same, which matters to `run_from_drive.py`, which uploads by modified time). Returns the file name, or `None` for a folder with no CSVs.
 - `refresh_year_count_files(ingest_dir)`: runs `write_year_count_file` for every four-digit folder under `ingest_dir` and returns `{year: filename}`. Called at the end of `merge_and_write_records` after the `.xlsx` files are written, and from `run_by_year` on a run with no input files.
 
 ### `runlog.py`
@@ -235,7 +239,7 @@ Problem categories the code emits:
 
 ### `alerts.py`
 
-- `build_alert_email(...)`: returns `(subject, body)`. The body has the run time, folders, new issues per year with date ranges, problems by year, problems not tied to a year, "Needs a look" items (full or summarized), years held back, resolved problems (counts only), auto-corrected dates, and the report path. Every section that could be long is capped with the helpers in `problems.py`: per-year sections show 10 years, corrections show 5, and "Needs a look" is summarized past 3 items of a kind. The subject reflects the state, in this order of precedence: held-back years, then problems with nothing held back, then corrections with all clear, then all clear.
+- `build_alert_email(..., corrections=(), complete_year_notices=())`: returns `(subject, body)`. The body has the run time, folders, new issues per year with date ranges, problems by year, problems not tied to a year, "Needs a look" items (full or summarized), years held back, resolved problems (counts only), auto-corrected dates, and the report path. Every section that could be long is capped with the helpers in `problems.py`: per-year sections show 10 years, corrections show 5, and "Needs a look" is summarized past 3 items of a kind. The subject reflects the state, in this order of precedence: held-back years, then problems with nothing held back, then new data for a year marked complete, then corrections with all clear, then all clear. The notices get their own section, capped at 10 lines. (Held-back and problems subjects take precedence, so the section may appear under those subjects.)
 - `send_error_email(subject, body)`: sends through `smtp.gmail.com` on port 465 with SSL. Reads the password from `EMAIL_APP_PASSWORD`. Never raises. A missing password or a failed send prints a warning and returns.
 
 ### `merge.py`
@@ -249,11 +253,11 @@ Problem categories the code emits:
        - if it exists and differs: listed as a *differing duplicate*, not overwritten
        - if the year is held back: counted in *held back*, not written
        - otherwise: *new*, queued for writing
-  3. **Writing.** New records are chunked. The first chunk appends to the active (last) file if there is room. Remaining chunks go into new `_partN` files. IDs continue from the highest existing ID.
+  3. **Writing.** New records are chunked. The first chunk appends to the active (last) file if there is room, unless the year is marked complete (`is_year_marked_complete`), in which case `can_continue` is forced false so every chunk goes to a new `_partN` file, and a line is added to `complete_year_notices`. Remaining chunks go into new `_partN` files. IDs continue from the highest existing ID.
   4. **`.xlsx`.** Each written file gets a fresh `.xlsx`.
-  5. **Report.** Written only when the run added issues, found differing duplicates, changed the problem set, or made a correction not reported before. "Changed" is judged on normalized problem text, and a correction is "new" if its note is not in `_Logs/last_corrections.txt`. A folder with a saved problem list but no saved corrections (last run by an older version) treats its current corrections as already reported.
+  5. **Report.** Written only when the run added issues, wrote new data for a year marked complete, found differing duplicates, changed the problem set, or made a correction not reported before. "Changed" is judged on normalized problem text, and a correction is "new" if its note is not in `_Logs/last_corrections.txt`. A folder with a saved problem list but no saved corrections (last run by an older version) treats its current corrections as already reported.
   6. **Problem set.** Saved every run.
-  7. **Email.** Sent when the problem set changed or there is a new correction. Only the new corrections are listed in it.
+  7. **Email.** Sent when the problem set changed, there is a new correction, or `complete_year_notices` is non-empty. The notices are one-time events and are not saved in `last_problems.txt`, since after the new part file is written the issues are present and the notice does not repeat. Only the new corrections are listed in it.
   8. **Run log and console summary.**
 
   Returns the set of held-back years. The caller uses it to keep their source files in `DataWaiting/`.
@@ -289,3 +293,4 @@ Imports `main` from `newspaper_ingest.cli` and calls it under `if __name__ == "_
 - **Date correction assumes the neighbors are right.** A correction is only as good as the surrounding issues' dates.
 - **Town names are not standardized.** Subject and geographic values are used exactly as typed in the Town List.
 - **`date_captured` uses the machine's local time**, not Eastern time, because it comes from `datetime.now()`. The GitHub runners run in UTC, so the value is the UTC date on those machines.
+- **`ingest_complete` is checked only in the merge loop.** A marked year is protected from being modified by `merge_and_write_records`. Nothing else writes year files, but a manual-mode run writes into its own folder with the same rule.

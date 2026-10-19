@@ -10,6 +10,7 @@ This document describes what happens when the pipeline runs in each situation it
 - If a year has a problem that might be a missing piece, the **whole year is held back** for that run. Its new issues are not written, and the files that feed it stay in `DataWaiting/`. Nothing is lost; the next run retries.
 - Problems that are only waiting for something to arrive (a Town List with no TIFFs yet, for example) do **not** hold a year back.
 - Input files move to `DataFilesCompleted/` only when everything in them has been used.
+- A year folder containing a file named `ingest_complete` is **never modified**. New issues for it go into a new numbered file and are reported (situation 24).
 - The alert email is sent **only when the set of problems changes**, so you are not emailed the same thing every run.
 
 ## Situations at a glance
@@ -39,6 +40,7 @@ This document describes what happens when the pipeline runs in each situation it
 | 21 | Email password missing or sending fails | Yes | No | Yes | Skipped, warning printed |
 | 22 | No input files at all | Nothing | n/a | No | No |
 | 23 | Manual mode | Yes | Per problems | No | Per problems |
+| 24 | Year marked `ingest_complete` | Never into existing files; new issues go to a new part file | No | Yes | Yes, once, when new data is found |
 
 ---
 
@@ -316,6 +318,25 @@ Use the normal folder mode for regular work.
 
 ---
 
+## 24. A year marked `ingest_complete`
+
+**Why.** Once a year's ingest file has been given to the repository, adding to it and ingesting it again would create duplicate records (they must be unpublished by hand and purged). So only complete years should be submitted, and a finished year must not change.
+
+**How to use it.** When a year is done and handed over, create an empty file named `ingest_complete` in that year's folder, for example `IngestFiles/1922/ingest_complete`. (`ingest_complete.txt` and capitals also work.) The pipeline never creates or removes this file.
+
+**What happens to a marked year.**
+- Its existing ingest CSVs (and their `.xlsx` copies) are never modified, appended to, or rewritten.
+- If nothing new turns up for it, nothing happens, exactly as in situation 2.
+- If new issues turn up for it (not already in its files), they are written to a **new numbered file** (`<year>-ingest_partN.csv`), never into an existing one. IDs in that file start at 1.
+- The run is reported: the merge report has a section `NEW DATA FOR YEARS MARKED ingest_complete`, the console prints a `NOTICE`, and an alert email is sent saying which year and which dates. The notice appears only on the run that writes the new file. The next run finds those issues already present and says nothing.
+- The count file still counts every part file in the year, so it will show the extra issues.
+- A later batch of new data for the same year makes yet another new part file.
+- If the marked year is also held back by a problem, nothing is written and the usual hold-back reporting applies. The new-data notice comes on the run that finally writes.
+
+**What to do about the notice.** Decide whether the new part file should be ingested as a small supplement (it holds only issues that were not ingested before, so it will not create duplicates), or whether the earlier file was wrong. If you remove the marker, the pipeline treats the year as ordinary again.
+
+---
+
 ## Files that move, and files that stay
 
 After a run, a file is in one of three places.
@@ -344,7 +365,23 @@ IngestFiles/1911/48issues432pages481lines.txt
 - **issues** are the Publication Issue rows, **pages** are the Page rows, and **lines** are the physical lines in the year's CSV files, header lines included. This is the same number `wc -l` reports. When a year has several part files, the three numbers are the totals across all of them.
 - The numbers are recounted from the CSV files on disk on every run, not carried over from earlier runs, so they always match what is really in the files.
 - When the totals change, the old count file is deleted and a new one with the new name is created, so each year folder has exactly one. When nothing changed, the file is left alone.
-- Inside the file is the same information in words, plus the line count of each CSV file, such as `1911-ingest.csv: 481 lines`.
+- Inside the file is the same information in words, the line count of each CSV file, and then **every issue in the year, one per line, in date order**, with its volume, issue number, and page count:
+
+  ```
+  1911: 48 issues, 432 pages, 481 lines (header lines included, as wc -l counts them)
+
+  Files:
+    1911-ingest.csv: 481 lines
+
+  Issues (48), one per line:
+  1911-01-06  Vol. XXXVIII No. 01  8 pages
+  1911-01-13  Vol. XXXVIII No. 02  8 pages
+  1911-01-20  Vol. XXXVIII No. 03  8 pages
+  ```
+
+  This is for checking a year for completeness. Gaps are easy to see in the dates, which should run a week apart for a weekly paper, and in the numbers within a volume. A volume that starts or ends inside the year shows where it changes.
+- The date shown is the date actually written to the ingest file. For an issue whose filename date was auto-corrected, that is the corrected date, not the typo.
+- The list is built from the CSV files on disk, so it covers every year already written, not only new ones. The first run after this feature was added fills it in for all existing years.
 - A year folder with no ingest CSVs gets no count file. Folders whose names are not four digits are ignored.
 - The count files are also brought up to date on a run that finds nothing in `DataWaiting/`. That is how the files get created for years written before this feature existed.
 - Counts of 1 still read `1issues` and `1pages`, so every file name has the same shape.
@@ -420,3 +457,4 @@ These are the places where the pipeline behaves in a way you might not expect. T
 7. **Date correction depends on the neighbors.** A corrected date is only as good as the issues on either side of it.
 8. **The `date_captured` field is the run date on the machine.** On GitHub Actions, that is the UTC date, which can be one day ahead of the Eastern date late in the evening.
 9. **Manual mode writes into the TIFF folder.** If that folder is your live root folder, manual output sits alongside the regular year folders and is recognized by later runs. Keep manual runs in a separate folder unless that is what you want.
+10. **`ingest_complete` protects only the files, not the data feed.** Nothing stops the marker being added to a year that is still incomplete. It also does not stop a new part file from being written for that year, by design (situation 24). If a year is in Drive, a marker created there must reach the folder the pipeline runs on.

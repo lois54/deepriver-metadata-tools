@@ -19,6 +19,7 @@ from .config import (
 from .folders import ensure_subdir
 from .ingest_files import (
     find_year_ingest_files,
+    is_year_marked_complete,
     make_year_ingest_filename,
     refresh_year_count_files,
     write_matching_xlsx,
@@ -43,7 +44,14 @@ from .runlog import (
     write_last_corrections,
     write_last_problems,
 )
-from .timeutil import format_eastern_timestamp, now_eastern
+from .timeutil import format_date_long, format_eastern_timestamp, now_eastern
+
+
+def _date_span(records):
+    """'Jan 2, 1885' or 'Jan 2, 1885 to Mar 6, 1885' for a list of issue records."""
+    dates = sorted(r["date"] for r in records)
+    first, last = format_date_long(dates[0]), format_date_long(dates[-1])
+    return first if first == last else f"{first} to {last}"
 
 
 def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
@@ -99,6 +107,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     matched_pages_total = 0
     mismatch_pages_total = 0
     new_summary_by_year = {}  # year -> {count, pages, min_date, max_date}
+    complete_year_notices = []  # new data found for years marked ingest_complete
 
     def bump(source_volume, outcome, page_count):
         entry = counts_by_source.setdefault(
@@ -164,10 +173,22 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         year_dir = ensure_subdir(ingest_dir, year)
         taken_names = {info["filename"] for info in existing_files}
         active_file = existing_files[-1] if existing_files else None
+        year_complete = bool(existing_files) and is_year_marked_complete(year_dir)
+        # A year marked ingest_complete is never appended to: its new issues
+        # always go into a brand-new numbered file.
         can_continue = (
             active_file is not None
+            and not year_complete
             and 1 + len(active_file["rows"]) < TARGET_LINES_PER_FILE
         )
+        if year_complete:
+            complete_year_notices.append(
+                f"{year} is marked ingest_complete, but {len(year_new_records)} "
+                f"new issue(s) were found "
+                f"({_date_span(year_new_records)}). The existing "
+                f"ingest file(s) were NOT changed. The new issue(s) are in a "
+                f"new numbered ingest file."
+            )
         start_line_count = 1 + len(active_file["rows"]) if can_continue else 1
         chunks = chunk_records_by_line_limit(
             year_new_records, start_line_count=start_line_count
@@ -242,7 +263,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # ---- Decide whether this run is worth a full report -------------------
     noteworthy = (
         bool(added_total) or bool(mismatch_lines) or problems_changed
-        or bool(new_corrections)
+        or bool(new_corrections) or bool(complete_year_notices)
     )
 
     report_path = None
@@ -281,6 +302,11 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             lines.extend(f"  - {path}" for path in written_files)
             lines.append("")
 
+        if complete_year_notices:
+            lines.append("NEW DATA FOR YEARS MARKED ingest_complete (existing files untouched):")
+            lines.extend(f"  - {n}" for n in complete_year_notices)
+            lines.append("")
+
         if held_back_counts:
             lines.append(
                 "YEARS HELD BACK THIS RUN (issue(s) matched but not written "
@@ -313,7 +339,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     write_last_corrections(log_root, set(corrections))
 
     # ---- Alert email, only when the problem picture changed ---------------
-    if problems_changed or new_corrections:
+    if problems_changed or new_corrections or complete_year_notices:
         resolved_problems = previous_compare - current_compare
         report_label = (
             f"/{MERGE_REPORTS_SUBDIR}/{os.path.basename(report_path)}"
@@ -327,13 +353,15 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             current_problems, resolved_problems, blocked_years,
             new_summary_by_year, report_label, DATA_WAITING_SUBDIR,
             ingest_dir_label, source_line, new_corrections,
+            complete_year_notices,
         )
         send_error_email(subject, body)
 
     summary = (
         f"new={added_total} matched={matched_count} "
         f"differing={len(mismatch_lines)} problems={len(current_problems)} "
-        f"held_back_years={len(blocked_years)}"
+        f"held_back_years={len(blocked_years)} "
+        f"complete_year_new_data={len(complete_year_notices)}"
     )
     if report_path:
         append_run_log(log_root, f"{summary} -> {os.path.basename(report_path)}")
@@ -357,6 +385,8 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         print("  Files written/updated:")
         for path in written_files:
             print(f"    - {path}")
+    for notice in complete_year_notices:
+        print(f"  NOTICE: {notice}")
     if held_back_counts:
         print("  Years held back this run (pending a fix):")
         for year in sorted(held_back_counts):

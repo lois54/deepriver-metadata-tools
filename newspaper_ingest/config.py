@@ -110,3 +110,8 @@ LOGS_SUBDIR_NAME = "_Logs"
 RUN_LOG_FILENAME = "run_log.txt"
 LAST_PROBLEMS_FILENAME = "last_problems.txt"
 LAST_CORRECTIONS_FILENAME = "last_corrections.txt"
+
+# A person creates an (empty) file with one of these names in a year folder to
+# say "this year's ingest is complete and has been given to the repository".
+# The pipeline then never modifies that year's existing ingest files.
+INGEST_COMPLETE_MARKER_NAMES = ("ingest_complete", "ingest_complete.txt")
