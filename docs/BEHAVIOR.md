@@ -41,6 +41,7 @@ This document describes what happens when the pipeline runs in each situation it
 | 22 | No input files at all | Nothing | n/a | No | No |
 | 23 | Manual mode | Yes | Per problems | No | Per problems |
 | 24 | Year marked `ingest_complete` | Never into existing files; new issues go to a new part file | No | Yes | Yes, once, when new data is found |
+| 25 | Weeks with no issue listed in `missing.txt` | n/a | No | No | No |
 
 ---
 
@@ -334,6 +335,19 @@ Use the normal folder mode for regular work.
 - If the marked year is also held back by a problem, nothing is written and the usual hold-back reporting applies. The new-data notice comes on the run that finally writes.
 
 **What to do about the notice.** Decide whether the new part file should be ingested as a small supplement (it holds only issues that were not ingested before, so it will not create duplicates), or whether the earlier file was wrong. If you remove the marker, the pipeline treats the year as ordinary again.
+
+---
+
+## 25. Finding missing weeks
+
+**What happens.** At the end of every run, and on a run with no input files, `missing.txt` in each year folder is rewritten if its content changed.
+- All years' issues are put in date order together. Any two neighbors more than 10 days apart have one missing week for each extra seven days. The estimated date is placed in the folder of the year it falls in (years with no folder are skipped).
+- Each missing week's date and label are counted from whichever known issue is nearer (forward from the earlier one, or back from the later one), a week at a time. The label rolls over into the next or previous volume after 52 issues (`ISSUES_PER_VOLUME`), so a gap that crosses March 20 is labelled correctly (for example `Vol. XLIII No. 52`, then `Vol. XLIV No. 01`). Labels are left blank more than about a year from a known issue.
+- Three or more weeks in a row are shown as one line.
+- Only whole issues are checked, not pages.
+- The first and last issue in the collection have no neighbor on one side, so they are checked against their calendar year (a year's first issue should be in its first week, its last in its last week).
+- It does not affect holds, files moving, or email.
+- A missing week is not necessarily an error: the paper may not have published that week.
 
 ---
 

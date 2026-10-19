@@ -4,8 +4,10 @@ Reading and writing the per-year ingest CSVs in IngestFiles/<year>/.
 
 import csv
 import os
+from datetime import date, timedelta
 
 from .config import INGEST_COMPLETE_MARKER_NAMES
+from .config import ISSUES_PER_VOLUME, MISSING_FILENAME, WEEKLY_GAP_TOLERANCE_DAYS
 from .patterns import YEAR_COUNT_FILENAME_PATTERN, YEAR_INGEST_FILENAME_PATTERN
 from .timeutil import parse_iso_date_or_none
 from .volumes import parse_issue_prefix
@@ -256,22 +258,218 @@ def write_year_count_file(year_dir, year):
     return marker_name
 
 
+# =============================================================================
+# THE MISSING-WEEKS FILE IN EACH YEAR FOLDER
+# The paper is a weekly, so an issue that is "missing" shows up as a gap of
+# more than a week between neighbouring issues. Gaps are looked for across
+# ALL year folders together (a volume runs from about March 20 to the next
+# March, so it spans two years), then each missing week is listed in the
+# folder of the year it falls in.
+# =============================================================================
+
+def _issue_date_or_none(date_iso):
+    try:
+        return date.fromisoformat(date_iso)
+    except (TypeError, ValueError):
+        return None
+
+
+def _roman_to_int(text):
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    if not text or any(ch not in values for ch in text):
+        return None
+    total = 0
+    for ch, nxt in zip(text, text[1:] + " "):
+        v = values[ch]
+        total += -v if nxt in values and values[nxt] > v else v
+    return total
+
+
+def _int_to_roman(number):
+    parts = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
+             (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
+             (5, "V"), (4, "IV"), (1, "I")]
+    out = ""
+    for value, letters in parts:
+        while number >= value:
+            out += letters
+            number -= value
+    return out
+
+
+def _step_label(volume, paper_no, steps):
+    """
+    'Vol. XLIV No. 05' - the volume and number `steps` weeks after (or, if
+    negative, before) a known issue, rolling over into the next (or previous)
+    volume after ISSUES_PER_VOLUME issues. '' if that can't be worked out or
+    is more than a year away.
+    """
+    if not volume or paper_no is None or abs(steps) > ISSUES_PER_VOLUME + 1:
+        return ""
+    number = paper_no + steps
+    volume_number = _roman_to_int(volume)
+    while number > ISSUES_PER_VOLUME or number < 1:
+        if volume_number is None:
+            return ""
+        if number > ISSUES_PER_VOLUME:
+            number -= ISSUES_PER_VOLUME
+            volume_number += 1
+        else:
+            number += ISSUES_PER_VOLUME
+            volume_number -= 1
+    shown = _int_to_roman(volume_number) if volume_number is not None else volume
+    return f"Vol. {shown} No. {number:02d}"
+
+
+def find_missing_weeks(issue_lists_by_year):
+    """
+    The weeks with no issue, from {year: issue_list} (issue_list as returned
+    by count_year_ingest_files). Returns {year: [(date, label), ...]} sorted
+    by date, with an entry (possibly an empty list) for every year given.
+
+    Between two consecutive known issues that are more than
+    WEEKLY_GAP_TOLERANCE_DAYS apart, every seventh day is a missing week. The
+    label is the best guess at its volume and number ('Vol. XI No. 40', from
+    counting on from the earlier issue, or back from the later one if the
+    volume changed in between), or '' if it cannot be worked out.
+
+    The first and last issue of the whole collection have no neighbour on one
+    side, so they are also checked against the edges of their own calendar
+    year: the first issue of a year should fall in its first week, and the last
+    in its last.
+    """
+    known = {}  # date -> (volume, paper_no)
+    for issue_list in issue_lists_by_year.values():
+        for date_iso, volume, paper_no, _pages in issue_list:
+            d = _issue_date_or_none(date_iso)
+            if d:
+                known.setdefault(d, (volume, paper_no))
+    ordered = sorted(known)
+
+    missing = {year: [] for year in issue_lists_by_year}
+
+    def add(d, label):
+        year = str(d.year)
+        if year in missing:
+            missing[year].append((d, label))
+
+    for a, b in zip(ordered, ordered[1:]):
+        gap = (b - a).days
+        if gap <= WEEKLY_GAP_TOLERANCE_DAYS:
+            continue
+        count = round(gap / 7) - 1
+        if count < 1:
+            continue
+        (vol_a, n_a), (vol_b, n_b) = known[a], known[b]
+        for i in range(1, count + 1):
+            # Date and label are both counted from whichever known issue is
+            # nearer, so a long gap can't drift or guess far from real data.
+            if i <= count + 1 - i:
+                d = a + timedelta(days=7 * i)
+                label = _step_label(vol_a, n_a, i)
+            else:
+                steps_back = count + 1 - i
+                d = b - timedelta(days=7 * steps_back)
+                label = _step_label(vol_b, n_b, -steps_back)
+            add(d, label)
+
+    if ordered:
+        first, last = ordered[0], ordered[-1]
+        d = first - timedelta(days=7)
+        while d.year == first.year:
+            add(d, "")
+            d -= timedelta(days=7)
+        d = last + timedelta(days=7)
+        while d.year == last.year:
+            add(d, "")
+            d += timedelta(days=7)
+
+    for year in missing:
+        missing[year].sort(key=lambda e: e[0])
+    return missing
+
+
+def _group_consecutive_weeks(entries):
+    """Split date-sorted (date, label) entries into runs of consecutive weeks."""
+    runs = []
+    for entry in entries:
+        if runs and 5 <= (entry[0] - runs[-1][-1][0]).days <= 9:
+            runs[-1].append(entry)
+        else:
+            runs.append([entry])
+    return runs
+
+
+def write_year_missing_file(year_dir, year, missing_entries):
+    """
+    Make '<year_dir>/missing.txt' list the weeks with no issue. Rewritten only
+    when its content changes. Returns the number of missing weeks.
+    """
+    lines = []
+    if missing_entries:
+        lines.append(f"{year}: {len(missing_entries)} week(s) with no issue (weekly paper):")
+        lines.append("")
+        for run in _group_consecutive_weeks(missing_entries):
+            if len(run) < 3:
+                for d, label in run:
+                    lines.append(f"{d.isoformat()}  {label}".rstrip() + "  (estimated date)")
+            else:
+                (d1, l1), (d2, l2) = run[0], run[-1]
+                numbers = f"  {l1} to {l2}" if l1 and l2 else ""
+                lines.append(f"{d1.isoformat()} to {d2.isoformat()}  "
+                             f"{len(run)} weeks in a row{numbers}")
+    else:
+        lines.append(f"{year}: no missing weeks found.")
+    lines += [
+        "",
+        "How to read this: each date is about where the missing issue would have",
+        "fallen, a week after the issue before it. A gap can also mean the paper",
+        "did not publish that week. Weeks near the start or end of the collection",
+        "are judged against the calendar year, so they may only mean the next or",
+        "previous year has not been done yet.",
+    ]
+    text = "\n".join(lines) + "\n"
+    path = os.path.join(year_dir, MISSING_FILENAME)
+    unchanged = False
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            unchanged = f.read() == text
+    if not unchanged:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    return len(missing_entries)
+
+
 def refresh_year_count_files(ingest_dir):
     """
-    Bring the count marker in every four-digit year folder under ingest_dir up
-    to date. Returns {year: marker_filename} for the folders that have one.
-    Folders whose names are not four digits are left alone.
+    Bring the count marker and the missing-weeks file in every four-digit year
+    folder under ingest_dir up to date. Returns {year: marker_filename} for the
+    folders that have a count marker. Folders whose names are not four digits
+    are left alone.
     """
     markers = {}
     if not os.path.isdir(ingest_dir):
         return markers
 
+    year_dirs = {}
     for name in sorted(os.listdir(ingest_dir)):
         year_dir = os.path.join(ingest_dir, name)
-        if not (len(name) == 4 and name.isdigit() and os.path.isdir(year_dir)):
-            continue
-        marker = write_year_count_file(year_dir, name)
+        if len(name) == 4 and name.isdigit() and os.path.isdir(year_dir):
+            year_dirs[name] = year_dir
+
+    issue_lists = {}
+    for year, year_dir in year_dirs.items():
+        marker = write_year_count_file(year_dir, year)
         if marker:
-            markers[name] = marker
+            markers[year] = marker
+            issue_lists[year] = count_year_ingest_files(year_dir)["issue_list"]
+        else:
+            stale = os.path.join(year_dir, MISSING_FILENAME)
+            if os.path.isfile(stale):
+                os.remove(stale)
+
+    missing = find_missing_weeks(issue_lists)
+    for year, entries in missing.items():
+        write_year_missing_file(year_dirs[year], year, entries)
 
     return markers

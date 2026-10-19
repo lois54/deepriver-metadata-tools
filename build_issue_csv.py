@@ -3,7 +3,7 @@
 # BUILD ISSUE CSV
 # =============================================================================
 # Generated: 2026-10-17 10:07 PM EDT
-# Last modified: 2026-10-19 04:40 PM EDT (years marked ingest_complete are never changed; new data goes to a new part file)
+# Last modified: 2026-10-19 05:33 PM EDT (missing.txt dates and volume labels counted from the nearest known issue)
 #
 # Entry point for the newspaper ingest pipeline. The code lives in the
 # newspaper_ingest/ package beside this file. See newspaper_ingest/cli.py for

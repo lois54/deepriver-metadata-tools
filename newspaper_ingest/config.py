@@ -115,3 +115,12 @@ LAST_CORRECTIONS_FILENAME = "last_corrections.txt"
 # say "this year's ingest is complete and has been given to the repository".
 # The pipeline then never modifies that year's existing ingest files.
 INGEST_COMPLETE_MARKER_NAMES = ("ingest_complete", "ingest_complete.txt")
+
+# The weekly paper's missing-weeks list in each year folder, and how many days
+# apart two consecutive issues may be before a week is called missing.
+MISSING_FILENAME = "missing.txt"
+WEEKLY_GAP_TOLERANCE_DAYS = 10
+# Issues in a volume (a volume runs a year from about March 20; the weekly
+# numbers go 1 to 52). Used only to guess the label of a missing week that is
+# in a different volume from the nearest known issue.
+ISSUES_PER_VOLUME = 52
