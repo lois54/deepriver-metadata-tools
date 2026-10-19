@@ -45,6 +45,7 @@ A default run goes through these steps.
    - skips and reports duplicates that differ
    - writes new issues, either appended to the active file or into a new file (`ingest_rows.chunk_records_by_line_limit`, `ingest_rows.rows_from_issue_record`)
    - regenerates `.xlsx` copies
+   - refreshes the count file in every year folder (`ingest_files.refresh_year_count_files`)
 5. `merge.py` writes the merge report if the run was noteworthy, saves the problem set, sends the alert email if the problem set changed, and writes the run log line.
 6. `cli.run_by_year` moves input files that are fully used (`folders.move_processed_input_files`). Held-back years keep their sources in `DataWaiting/`.
 
@@ -86,6 +87,9 @@ Compiled regular expressions. Each has a comment explaining the groups.
 - `PROBLEM_YEAR_PATTERN`: finds a plausible YYYYMMDD date inside a problem message. Month 01 to 12 and day 01 to 31 are enforced, so a date like `19110231` matches but `19111331` does not.
 - `PROBLEM_CATEGORY_PATTERN`: finds the leading `[category]` tag.
 - `INVALID_DATE_VALUE_PATTERN`: pulls the bad date out of an `invalid_date` message for the email.
+- `YEAR_COUNT_FILENAME_PATTERN`: matches the count file name in a year folder, such as `48issues432pages481lines.txt`.
+- `UNRECOGNIZED_ITEM_PATTERN`: pulls the skipped name out of an `unrecognized_filename` message, so the email can group names by file type.
+- `PROBLEM_SOURCE_FILE_PATTERN`: pulls the source file tag (`[1924tifflist.txt]`) that precedes the category tag, when there is one.
 
 ### `timeutil.py`
 
@@ -172,12 +176,17 @@ Compiled regular expressions. Each has a comment explaining the groups.
 Problem strings are the link between the pipeline and its reports. Each starts with a `[category]` tag, and most include an 8-digit date so they can be attached to a year.
 
 - `PROBLEM_CATEGORY_LABELS`: readable names for the email.
-- `PROBLEM_CATEGORY_VERBATIM` (`file_read_error`, `unrecognized_filename`): printed in full under "Needs a look" in the email, not counted.
+- `PROBLEM_CATEGORY_VERBATIM` (`file_read_error`, `unrecognized_filename`): listed under "Needs a look" in the email instead of being folded into a count. Up to `VERBATIM_FULL_LIMIT` (3) of a kind are printed in full. More are summarized (see `summarize_verbatim_problems`).
+- `VERBATIM_FULL_LIMIT` (3), `EMAIL_SECTION_LINE_LIMIT` (10), `INVALID_DATE_LIST_LIMIT` (3): the limits that keep the email short. Change them here.
 - `PROBLEM_CATEGORIES_NEVER_BLOCK` (`missing_tiffs`, `unrecognized_filename`): these never hold a year back. A Town List waiting for its TIFFs is a normal state, not an error.
 - `extract_year_from_problem(text)`: the year from the first plausible date in a message, or `None`.
 - `problem_category(text)`: the leading tag, or `"other"`.
 - `group_problems(problems)`: returns `(by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts)`.
-- `format_problem_summary_lines(problems, verbatim_as_lines)`: summary lines for the resolved-problems section of the email.
+- `format_date_list(dates, limit)`: `'19110231', '19110230'` for a few dates, or the first few plus `and N more`.
+- `format_year_problem_line(year, category_counts, invalid_dates)`: one year's line, such as `  1911: 2 invalid date ('19110231', '19110230'); 1 missing town list`.
+- `cap_lines(lines, limit, noun, pointer)`: shows the first `limit` lines and replaces the rest with `... and N more <noun>`. The `pointer` text (default ` (see the full report)`) is dropped where the full report does not list the items, as in the resolved section.
+- `summarize_verbatim_problems(problems, full_limit)`: the "Needs a look" lines. Few problems are printed in full. For many `unrecognized_filename` problems it groups the skipped names by file extension, with a count and one example (and source file) each, notes names that are a listing file's own name, and notes how many files they came from. Other verbatim categories get a count and their first message.
+- `format_problem_summary_lines(problems, verbatim_as_lines)`: summary lines for the resolved-problems section of the email. The per-year lines are capped.
 
 Problem categories the code emits:
 
@@ -205,6 +214,9 @@ Problem categories the code emits:
 - `scan_existing_issue_keys(ingest_dir)`: the `(volume, paper_no)` key of every Publication Issue already in any year folder, read from `local_identifier`. Only year subfolders are read. Files sitting directly in `IngestFiles/` are not.
 - `make_year_ingest_filename(folder, year, taken_names)`: `<year>-ingest.csv`, or `<year>-ingest_partN.csv` when that name is taken.
 - `write_matching_xlsx(csv_path)`: rewrites `<same name>.xlsx` from the CSV. Uses `openpyxl`, imported only here.
+- `count_year_ingest_files(year_dir)`: returns `(issues, pages, lines, per_file)` for the year's CSVs, or `None` if there are none. Issues and pages are counted from the `model` column (`Publication Issue`, `Page`). Lines are counted as the number of newline characters in each file, header included, which matches `wc -l`.
+- `write_year_count_file(year_dir, year)`: makes the folder's count file match the CSVs. The name is `<issues>issues<pages>pages<lines>lines.txt` and the body repeats the numbers in words plus each CSV's line count. It deletes any other file matching `YEAR_COUNT_FILENAME_PATTERN` first, so only one exists, and does not rewrite a file whose content is already right (its modified time stays the same, which matters to `run_from_drive.py`, which uploads by modified time). Returns the file name, or `None` for a folder with no CSVs.
+- `refresh_year_count_files(ingest_dir)`: runs `write_year_count_file` for every four-digit folder under `ingest_dir` and returns `{year: filename}`. Called at the end of `merge_and_write_records` after the `.xlsx` files are written, and from `run_by_year` on a run with no input files.
 
 ### `runlog.py`
 
@@ -219,7 +231,7 @@ Problem categories the code emits:
 
 ### `alerts.py`
 
-- `build_alert_email(...)`: returns `(subject, body)`. The body has the run time, folders, new issues per year with date ranges, problems by year, problems not tied to a year, "Needs a look" items printed in full, years held back, resolved problems (counts only), auto-corrected dates, and the report path. The subject reflects the state, in this order of precedence: held-back years, then problems with nothing held back, then corrections with all clear, then all clear.
+- `build_alert_email(...)`: returns `(subject, body)`. The body has the run time, folders, new issues per year with date ranges, problems by year, problems not tied to a year, "Needs a look" items (full or summarized), years held back, resolved problems (counts only), auto-corrected dates, and the report path. Every section that could be long is capped with the helpers in `problems.py`: per-year sections show 10 years, corrections show 5, and "Needs a look" is summarized past 3 items of a kind. The subject reflects the state, in this order of precedence: held-back years, then problems with nothing held back, then corrections with all clear, then all clear.
 - `send_error_email(subject, body)`: sends through `smtp.gmail.com` on port 465 with SSL. Reads the password from `EMAIL_APP_PASSWORD`. Never raises. A missing password or a failed send prints a warning and returns.
 
 ### `merge.py`

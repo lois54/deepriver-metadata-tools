@@ -65,3 +65,16 @@ PROBLEM_CATEGORY_PATTERN = re.compile(r'\[(\w+)\]')
 
 # The bad date value inside an invalid_date problem message.
 INVALID_DATE_VALUE_PATTERN = re.compile(r"invalid date \('([^']+)'\)")
+
+# The skipped name inside an unrecognized_filename message:
+#   "... [unrecognized_filename] '19240229_vLI_n01.pdf' does not match ..."
+# Greedy, so a name containing an apostrophe is still captured whole.
+UNRECOGNIZED_ITEM_PATTERN = re.compile(r"'(.+)' does not match")
+
+# The source file tag that gather_all_records puts in front of a problem:
+#   "[1924tifflist.txt] [unrecognized_filename] ..."
+# Only matches when a file tag precedes the category tag.
+PROBLEM_SOURCE_FILE_PATTERN = re.compile(r'^\[([^\]]+)\]\s+\[\w+\]')
+
+# The count marker file in each year folder, e.g. "48issues432pages481lines.txt".
+YEAR_COUNT_FILENAME_PATTERN = re.compile(r'^\d+issues\d+pages\d+lines\.txt$')

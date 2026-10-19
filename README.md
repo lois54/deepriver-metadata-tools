@@ -33,7 +33,7 @@ The root folder holds these subfolders. They are created automatically the first
 |---|---|
 | `DataWaiting/` | Input. Tifflist and Town List files go here. |
 | `DataFilesCompleted/` | Input files moved here once everything in them has been used. |
-| `IngestFiles/<year>/` | Output. One folder per year, containing `<year>-ingest.csv` (or `<year>-ingest_partN.csv` when a year grows large) and a matching `.xlsx` copy of each CSV. |
+| `IngestFiles/<year>/` | Output. One folder per year, containing `<year>-ingest.csv` (or `<year>-ingest_partN.csv` when a year grows large), a matching `.xlsx` copy of each CSV, and a count file such as `48issues432pages481lines.txt`. |
 | `MergeReports/` | `Ingest_merge_report_<timestamp>.txt`. Written only when the run added something, found a difference, or the set of problems changed. |
 | `_Logs/` | `run_log.txt`, one line per run. `last_problems.txt`, the problem list from the previous run, used to decide whether anything changed. Do not edit. |
 
@@ -96,6 +96,7 @@ The first two read everything in `DataWaiting/` and are the normal way to run it
 - Nothing is lost by a hold-back. Every run rebuilds the picture from the input files, so a held-back issue is picked up as soon as its missing piece appears.
 - Dates in filenames are checked. Some typos are corrected automatically and reported. Others are reported and held back. See `docs/BEHAVIOR.md`, situations 7 and 8.
 - The `.xlsx` copies are regenerated from the CSVs each time a file is written. Edit the CSV, not the `.xlsx`.
+- Each year folder has a **count file** whose name gives the year's totals, for example `48issues432pages481lines.txt`: 48 issues, 432 pages, and 481 lines across the year's ingest CSVs, header lines included (the number `wc -l` shows). It is recounted from the CSVs on every run and renamed when the totals change, so there is only ever one. Inside is the same information plus each CSV's line count.
 
 ## Documentation
 

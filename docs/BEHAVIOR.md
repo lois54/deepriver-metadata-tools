@@ -155,8 +155,18 @@ A held-back year never blocks other years.
 - That line is skipped and reported as `unrecognized filename`.
 - Every other line in the file is processed normally.
 - This does **not** hold back any year.
-- The file is still moved to `DataFilesCompleted/` if everything else in it was used. The report is the only place the skipped line is recorded.
-- The email lists it under **Needs a look**, in full, the first time it appears.
+- The file is still moved to `DataFilesCompleted/` if everything else in it was used. The merge report is the only place every skipped line is recorded, in full.
+- The email lists them under **Needs a look** the first time they appear. Up to 3 skipped names are printed in full. More than 3 are summarized: a total, then one line per file type with its count and one example. For example:
+
+  ```
+  Needs a look:
+    58 skipped names did not match the expected pattern, by type:
+      .pdf: 52  (for example '19240229_vLI_n01.pdf' in 1924tifflist.txt)
+      .txt: 6  (for example '1924tifflist.txt' in 1924tifflist.txt)  - each is the listing file's own name
+      spread across 6 files
+  ```
+
+  A listing made by dumping a folder often includes its own filename. Those show up as a `.txt` line marked as the listing file's own name, and they are harmless.
 
 ## 10. A file cannot be read
 
@@ -167,7 +177,7 @@ A held-back year never blocks other years.
 - The file **stays in `DataWaiting/`**, because it contributed nothing.
 - Other files are processed normally.
 - This does not hold back a year.
-- The email lists it under **Needs a look**.
+- The email lists it under **Needs a look**. Up to 3 unreadable files are printed in full. More than 3 are summarized as a count with the first one as an example.
 
 **Tip.** If a Town List is open in Excel, close it. Some systems lock open files.
 
@@ -286,8 +296,9 @@ Put `notes_config.txt` in the repository root, next to `build_issue_csv.py`.
 
 **What happens.**
 - The console says `No tifflist or Town List files found.`
+- The count file in each year folder is brought up to date (see **Output files**).
 - One line is written to the run log.
-- Nothing is written, moved, or emailed.
+- No issues are written, no files are moved, and no email is sent.
 
 ## 23. Manual mode
 
@@ -322,6 +333,20 @@ For every year that gets a new issue, the pipeline:
 
 - appends to the last year file if there is room, or starts a new one
 - writes a matching `.xlsx` copy of that file, regenerated in full
+
+Then, for **every** year folder, it brings the **count file** up to date. This is a small text file whose name carries the year's totals, for example:
+
+```
+IngestFiles/1911/48issues432pages481lines.txt
+```
+
+- **issues** are the Publication Issue rows, **pages** are the Page rows, and **lines** are the physical lines in the year's CSV files, header lines included. This is the same number `wc -l` reports. When a year has several part files, the three numbers are the totals across all of them.
+- The numbers are recounted from the CSV files on disk on every run, not carried over from earlier runs, so they always match what is really in the files.
+- When the totals change, the old count file is deleted and a new one with the new name is created, so each year folder has exactly one. When nothing changed, the file is left alone.
+- Inside the file is the same information in words, plus the line count of each CSV file, such as `1911-ingest.csv: 481 lines`.
+- A year folder with no ingest CSVs gets no count file. Folders whose names are not four digits are ignored.
+- The count files are also brought up to date on a run that finds nothing in `DataWaiting/`. That is how the files get created for years written before this feature existed.
+- Counts of 1 still read `1issues` and `1pages`, so every file name has the same shape.
 
 Issue rows appear in date order within a run. A Publication Issue row is followed by its Page rows, numbered from 1 to the number of pages.
 
@@ -364,7 +389,14 @@ Sent when the problem set has changed since the previous run, or when a date was
 3. `Newspaper pipeline: all clear (N date(s) auto-corrected)`
 4. `Newspaper pipeline: all clear`
 
-**Body.** Run time, folders read and written, new issues per year with the date range, problems by year, problems not tied to a year, items under **Needs a look** in full, held-back years, resolved problems since the last run (counts only), auto-corrected dates, and the report path.
+**Body.** Run time, folders read and written, new issues per year with the date range, problems by year, problems not tied to a year, items under **Needs a look**, held-back years, resolved problems since the last run (counts only), auto-corrected dates, and the report path.
+
+**Keeping it short.** The email never lists a long run of lines. The full detail is always in the merge report named at the bottom.
+- **Needs a look**: up to 3 items of a kind are printed in full. More than 3 are summarized. Skipped filenames are grouped by file type with a count and an example for each. Other kinds show a count and the first message as an example.
+- **New issues added**, **Problems by year**, and **Resolved**: the first 10 years are shown, then one line such as `... and 4 more years (see the full report)`.
+- **Invalid dates** in a year's line: the first 3 are shown, then `and N more`.
+- **Auto-corrected dates**: the first 5 are shown, then `... and N more corrections (see the full report)`.
+- The list of held-back years is a single line.
 
 **"Resolved"** means a problem from the last run that is no longer present. A problem that goes away because its missing piece arrived shows here.
 

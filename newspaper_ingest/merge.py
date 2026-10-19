@@ -17,7 +17,12 @@ from .config import (
     COLUMNS,
 )
 from .folders import ensure_subdir
-from .ingest_files import find_year_ingest_files, make_year_ingest_filename, write_matching_xlsx
+from .ingest_files import (
+    find_year_ingest_files,
+    make_year_ingest_filename,
+    refresh_year_count_files,
+    write_matching_xlsx,
+)
 from .ingest_rows import (
     build_parent_row_dict,
     chunk_records_by_line_limit,
@@ -199,6 +204,10 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
 
     for path in written_files:
         write_matching_xlsx(path)
+
+    # Keep the count marker (e.g. 48issues432pages481lines.txt) in every year
+    # folder in step with the CSVs, recounted from the files on disk.
+    refresh_year_count_files(ingest_dir)
 
     # ---- Decide whether this run is worth a full report -------------------
     previous_problems = read_last_problems(log_root)

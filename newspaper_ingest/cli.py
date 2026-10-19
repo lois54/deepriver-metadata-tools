@@ -26,7 +26,7 @@ from .config import (
     MERGE_REPORTS_SUBDIR,
 )
 from .folders import ensure_subdir, move_processed_input_files
-from .ingest_files import scan_existing_issue_keys
+from .ingest_files import refresh_year_count_files, scan_existing_issue_keys
 from .merge import merge_and_write_records
 from .notes import load_notes
 from .records import gather_all_records, records_from_single_source
@@ -55,6 +55,9 @@ def run_by_year(directory):
 
     if not tiff_filenames and not townlist_filenames:
         print("No tifflist or Town List files found.")
+        # Still make sure each year folder's count marker is current (this
+        # also creates the markers for years written before they existed).
+        refresh_year_count_files(ingest_dir)
         append_run_log(directory, "no tifflist or Town List files found in this run")
         return
 

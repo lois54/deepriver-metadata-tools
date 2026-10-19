@@ -10,10 +10,11 @@ from email.mime.text import MIMEText
 from .config import EMAIL_RECIPIENTS, EMAIL_SENDER
 from .problems import (
     PROBLEM_CATEGORY_LABELS,
-    PROBLEM_CATEGORY_VERBATIM,
+    cap_lines,
     format_problem_summary_lines,
+    format_year_problem_line,
     group_problems,
-    problem_category,
+    summarize_verbatim_problems,
 )
 from .timeutil import format_date_long, format_eastern_timestamp
 
@@ -24,14 +25,19 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
     """
     Build (subject, body) for the alert email.
 
-    Short by design: one line per year with problem counts, one line per
-    category not tied to a year, and the rare one-off problems printed in
-    full for current problems only. Resolved problems get counts only.
+    Short by design. Every section that could run to many lines is capped:
+      - one line per year (new issues, problems), first 10 shown, the rest
+        folded into one "and N more years" line
+      - one-off problems under "Needs a look": printed in full when there
+        are 3 or fewer of a kind, otherwise summarized as a count per file
+        type with an example
+      - auto-corrected dates: first 5 shown, the rest folded into a count
+    Resolved problems get counts only. The merge report named at the bottom
+    always has the full detail.
 
     new_summary_by_year - {year: {count, pages, min_date, max_date}} for the
     issues actually written this run.
-    corrections - notes on dates that were auto-corrected this run, printed
-    in full.
+    corrections - notes on dates that were auto-corrected this run.
     """
     lines = [
         f"Run at: {format_eastern_timestamp()}",
@@ -43,13 +49,15 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
 
     if new_summary_by_year:
         lines.append("New issues added:")
+        year_lines = []
         for year in sorted(new_summary_by_year):
             s = new_summary_by_year[year]
             noun = "issue" if s["count"] == 1 else "issues"
             date_range = (
                 f"{format_date_long(s['min_date'])} thru {format_date_long(s['max_date'])}"
             )
-            lines.append(f"  {year}: {s['count']} {noun} ({s['pages']} pages), {date_range}")
+            year_lines.append(f"  {year}: {s['count']} {noun} ({s['pages']} pages), {date_range}")
+        lines.extend(cap_lines(year_lines, noun="years"))
     else:
         lines.append("No issues added this run")
     lines.append("")
@@ -60,17 +68,12 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
 
     if by_year_category:
         lines.append("Problems by year:")
-        for year in sorted(by_year_category):
-            parts = []
-            for category in sorted(by_year_category[year]):
-                count = by_year_category[year][category]
-                label = PROBLEM_CATEGORY_LABELS.get(category, category)
-                if category == "invalid_date" and invalid_dates_by_year.get(year):
-                    dates_str = ", ".join(f"'{d}'" for d in invalid_dates_by_year[year])
-                    parts.append(f"{count} {label} ({dates_str})")
-                else:
-                    parts.append(f"{count} {label}")
-            lines.append(f"  {year}: " + "; ".join(parts))
+        year_lines = [
+            format_year_problem_line(year, by_year_category[year],
+                                     invalid_dates_by_year.get(year, ()))
+            for year in sorted(by_year_category)
+        ]
+        lines.extend(cap_lines(year_lines, noun="years"))
         lines.append("")
 
     if aggregate_by_category:
@@ -82,9 +85,7 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
 
     if verbatim_counts:
         lines.append("Needs a look:")
-        for p in sorted(current_problems):
-            if problem_category(p) in PROBLEM_CATEGORY_VERBATIM:
-                lines.append(f"  - {p}")
+        lines.extend(summarize_verbatim_problems(current_problems))
         lines.append("")
 
     if blocked_years:
@@ -104,7 +105,7 @@ def build_alert_email(current_problems, resolved_problems, blocked_years,
     if corrections:
         noun = "date" if len(corrections) == 1 else "dates"
         lines.append(f"Auto-corrected {noun} this run:")
-        lines.extend(f"  - {c}" for c in corrections)
+        lines.extend(cap_lines([f"  - {c}" for c in corrections], limit=5, noun="corrections"))
         lines.append("")
 
     if report_path:
