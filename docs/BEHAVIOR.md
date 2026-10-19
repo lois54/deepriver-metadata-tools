@@ -22,7 +22,7 @@ This document describes what happens when the pipeline runs in each situation it
 | 4 | TIFFs for an issue, no Town List entry yet | No | **Yes** | TIFF file stays | Yes, first time |
 | 5 | Both kinds of gap in the same year | No | Yes | Feeding files stay | Yes |
 | 6 | One year held back, others fine | Other years yes | Only that year | Unrelated files move | Yes |
-| 7 | Invalid TIFF date, correctable | Yes | No | Yes | Yes (correction listed) |
+| 7 | Invalid TIFF date, correctable | Yes | No | Yes | Once, when first corrected |
 | 8 | Invalid TIFF date, not correctable | No | Yes (if year found) | TIFF file stays | Yes |
 | 9 | Unrecognized filename or line | Rest of file yes | No | Yes, unless something else pends | Yes, first time |
 | 10 | A file cannot be read | Other files yes | No | That file stays | Yes |
@@ -53,7 +53,7 @@ This document describes what happens when the pipeline runs in each situation it
 - The tifflist and Town List both have nothing pending, so both move to `DataFilesCompleted/`.
 - A merge report is written, because issues were added.
 - The run log gets a line such as `new=2 matched=0 differing=0 problems=0 held_back_years=0 -> Ingest_merge_report_....txt`.
-- The email is sent only if the set of problems changed. If there are no problems at all, there is no email, unless a date was auto-corrected.
+- The email is sent only if the set of problems changed, or a date was auto-corrected for the first time. If there are no problems at all, there is no email, unless a new date correction appeared.
 
 ## 2. Re-running with nothing new
 
@@ -127,8 +127,9 @@ A held-back year never blocks other years.
 
 **What you will see.**
 - The issue is written with the corrected date. Its title, year, and file name use the corrected date.
-- The correction is listed in the merge report under **DATES AUTO-CORRECTED THIS RUN**.
+- The correction is listed in the merge report under **DATES AUTO-CORRECTED (new this run)**.
 - The alert email has an **Auto-corrected date** section, and its subject reads `all clear (1 date auto-corrected)` if nothing else is wrong.
+- **A correction is announced once.** While the tifflist with the typo stays in `DataWaiting/`, every run works out the same correction again, because the typo is still in the file. Later runs do not report it again, write a new report for it, or send another email. A different, new correction is announced the same way.
 
 **Check it.** A correction is only as good as the neighboring issues. Look at the corrected date against the scan before the file goes to the repository.
 
@@ -363,7 +364,7 @@ The publisher is chosen by date. Sheldon up to 1885, Kirtland from 1885, Prann f
 
 ## The merge report
 
-Written only when the run added issues, found differing duplicates, changed the problem set, or auto-corrected a date. It lists, in this order:
+Written only when the run added issues, found differing duplicates, changed the problem set, or made a new auto-correction. It lists, in this order:
 
 1. Run time and folders
 2. New issues, already present, and differing duplicates, with page counts
@@ -380,7 +381,9 @@ Written only when the run added issues, found differing duplicates, changed the 
 
 ## The alert email
 
-Sent when the problem set has changed since the previous run, or when a date was auto-corrected. Otherwise it is not sent.
+Sent when the problem set has changed since the previous run, or when a date was auto-corrected for the first time. Otherwise it is not sent. A rerun with the same data sends nothing.
+
+**What counts as "changed".** The run compares this run's problems with the last run's, one problem at a time. A problem is the same one when its category, issue, file, and date are the same. One thing is deliberately ignored: a `missing tiffs` message says how many tifflist files were searched, and that number goes down whenever a finished tifflist moves to `DataFilesCompleted/`. Moving a file is not a change in the problems, so it does not cause an email. The correction notes are tracked the same way, in `_Logs/last_corrections.txt`.
 
 **Subject**, in order of precedence:
 
@@ -400,7 +403,7 @@ Sent when the problem set has changed since the previous run, or when a date was
 
 **"Resolved"** means a problem from the last run that is no longer present. A problem that goes away because its missing piece arrived shows here.
 
-**Resetting the alert state.** Deleting `_Logs/last_problems.txt` makes the next run treat every current problem as new, so the email is sent again. Only do this on purpose.
+**Resetting the alert state.** Deleting `_Logs/last_problems.txt` makes the next run treat every current problem as new, so the email is sent again. Deleting `_Logs/last_corrections.txt` alone does not, because a folder with a saved problem list is assumed to have announced its corrections already. Delete both to announce everything again. Only do this on purpose.
 
 ---
 

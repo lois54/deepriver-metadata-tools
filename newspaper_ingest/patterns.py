@@ -76,5 +76,11 @@ UNRECOGNIZED_ITEM_PATTERN = re.compile(r"'(.+)' does not match")
 # Only matches when a file tag precedes the category tag.
 PROBLEM_SOURCE_FILE_PATTERN = re.compile(r'^\[([^\]]+)\]\s+\[\w+\]')
 
+# The part of a "missing tiffs" message that names where the TIFFs were looked
+# for ("... has been found in 9 tifflist file(s) yet ..."). The count changes
+# whenever a tifflist moves out of DataWaiting, so it is ignored when this
+# run's problems are compared with the last run's.
+SOURCE_LABEL_IN_PROBLEM_PATTERN = re.compile(r"has been found in .+? yet")
+
 # The count marker file in each year folder, e.g. "48issues432pages481lines.txt".
 YEAR_COUNT_FILENAME_PATTERN = re.compile(r'^\d+issues\d+pages\d+lines\.txt$')

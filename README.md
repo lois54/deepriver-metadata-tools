@@ -35,7 +35,7 @@ The root folder holds these subfolders. They are created automatically the first
 | `DataFilesCompleted/` | Input files moved here once everything in them has been used. |
 | `IngestFiles/<year>/` | Output. One folder per year, containing `<year>-ingest.csv` (or `<year>-ingest_partN.csv` when a year grows large), a matching `.xlsx` copy of each CSV, and a count file such as `48issues432pages481lines.txt`. |
 | `MergeReports/` | `Ingest_merge_report_<timestamp>.txt`. Written only when the run added something, found a difference, or the set of problems changed. |
-| `_Logs/` | `run_log.txt`, one line per run. `last_problems.txt`, the problem list from the previous run, used to decide whether anything changed. Do not edit. |
+| `_Logs/` | `run_log.txt`, one line per run. `last_problems.txt` and `last_corrections.txt`, what the previous run reported, used to decide whether anything is new (so the same thing is not emailed twice). Do not edit. |
 
 ## Input files
 

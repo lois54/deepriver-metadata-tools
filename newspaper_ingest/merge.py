@@ -29,8 +29,20 @@ from .ingest_rows import (
     normalize_for_compare,
     rows_from_issue_record,
 )
-from .problems import PROBLEM_CATEGORIES_NEVER_BLOCK, extract_year_from_problem, problem_category
-from .runlog import append_run_log, read_last_problems, write_last_problems
+from .problems import (
+    PROBLEM_CATEGORIES_NEVER_BLOCK,
+    extract_year_from_problem,
+    normalize_problem_for_compare,
+    problem_category,
+)
+from .runlog import (
+    append_run_log,
+    last_problems_file_exists,
+    read_last_corrections,
+    read_last_problems,
+    write_last_corrections,
+    write_last_problems,
+)
 from .timeutil import format_eastern_timestamp, now_eastern
 
 
@@ -209,12 +221,28 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
     # folder in step with the CSVs, recounted from the files on disk.
     refresh_year_count_files(ingest_dir)
 
+    # ---- What is NEW since the last run? ----------------------------------
+    # Problems are compared in a normalized form (see
+    # normalize_problem_for_compare), so wording that changes for harmless
+    # reasons does not make an unchanged problem look new.
+    current_compare = {normalize_problem_for_compare(p) for p in current_problems}
+    had_previous_run = last_problems_file_exists(log_root)
+    previous_compare = {normalize_problem_for_compare(p) for p in read_last_problems(log_root)}
+    problems_changed = current_compare != previous_compare
+
+    # An auto-corrected date is found again on every run for as long as its
+    # tifflist stays in DataWaiting, so it is only announced the first time.
+    # A folder last run by an older version has no saved corrections; in that
+    # case the ones already being reported are treated as announced.
+    previous_corrections = read_last_corrections(log_root)
+    if previous_corrections is None:
+        previous_corrections = set(corrections) if had_previous_run else set()
+    new_corrections = [c for c in corrections if c not in previous_corrections]
+
     # ---- Decide whether this run is worth a full report -------------------
-    previous_problems = read_last_problems(log_root)
-    problems_changed = current_problems != previous_problems
     noteworthy = (
         bool(added_total) or bool(mismatch_lines) or problems_changed
-        or bool(corrections)
+        or bool(new_corrections)
     )
 
     report_path = None
@@ -262,9 +290,9 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
                 lines.append(f"  - {year}: {held_back_counts[year]} issue(s) waiting")
             lines.append("")
 
-        if corrections:
-            lines.append("DATES AUTO-CORRECTED THIS RUN:")
-            lines.extend(f"  - {c}" for c in corrections)
+        if new_corrections:
+            lines.append("DATES AUTO-CORRECTED (new this run):")
+            lines.extend(f"  - {c}" for c in new_corrections)
             lines.append("")
 
         if mismatch_lines:
@@ -281,11 +309,12 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
             f.write("\n".join(lines) + "\n")
 
     # Saved every run, so the next run has something current to compare against.
-    write_last_problems(log_root, current_problems)
+    write_last_problems(log_root, current_compare)
+    write_last_corrections(log_root, set(corrections))
 
     # ---- Alert email, only when the problem picture changed ---------------
-    if problems_changed or corrections:
-        resolved_problems = previous_problems - current_problems
+    if problems_changed or new_corrections:
+        resolved_problems = previous_compare - current_compare
         report_label = (
             f"/{MERGE_REPORTS_SUBDIR}/{os.path.basename(report_path)}"
             if report_path else None
@@ -297,7 +326,7 @@ def merge_and_write_records(log_root, ingest_dir, reports_dir, all_records,
         subject, body = build_alert_email(
             current_problems, resolved_problems, blocked_years,
             new_summary_by_year, report_label, DATA_WAITING_SUBDIR,
-            ingest_dir_label, source_line, corrections,
+            ingest_dir_label, source_line, new_corrections,
         )
         send_error_email(subject, body)
 

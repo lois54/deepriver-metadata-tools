@@ -11,6 +11,7 @@ from .patterns import (
     PROBLEM_CATEGORY_PATTERN,
     PROBLEM_SOURCE_FILE_PATTERN,
     PROBLEM_YEAR_PATTERN,
+    SOURCE_LABEL_IN_PROBLEM_PATTERN,
     UNRECOGNIZED_ITEM_PATTERN,
 )
 
@@ -65,6 +66,19 @@ def problem_category(problem_text):
     """The [category] tag of a problem message, or 'other' if none."""
     match = PROBLEM_CATEGORY_PATTERN.search(problem_text)
     return match.group(1) if match else "other"
+
+
+def normalize_problem_for_compare(problem_text):
+    """
+    The form of a problem message used to decide whether the problem is the
+    SAME one as last run's. Everything that identifies the problem (category,
+    issue, file, date) is kept. The one volatile part is dropped: a
+    'missing tiffs' message says how many tifflist files were searched, and
+    that number changes whenever a finished tifflist moves to
+    DataFilesCompleted. Without this, every missing-tiffs problem would look
+    resolved-and-new on the next run and trigger an email.
+    """
+    return SOURCE_LABEL_IN_PROBLEM_PATTERN.sub("has been found yet", problem_text)
 
 
 def group_problems(problems):

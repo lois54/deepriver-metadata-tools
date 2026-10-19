@@ -67,7 +67,7 @@ Plain constants. No functions.
 - `MAX_CONTIGUOUS_YEAR_GAP` (1): a gap larger than this between consecutive issues forces a new file.
 - `MAX_DATE_CORRECTION_GAP_DAYS` (60): the widest neighbor gap that date correction will trust.
 - `COLUMNS`: the 64 column names, in the order the repository expects. Changing the order breaks the ingest.
-- Folder and file names: `DATA_WAITING_SUBDIR`, `DATA_COMPLETED_SUBDIR`, `INGEST_FILES_SUBDIR`, `MERGE_REPORTS_SUBDIR`, `LOGS_SUBDIR_NAME`, `RUN_LOG_FILENAME`, `LAST_PROBLEMS_FILENAME`.
+- Folder and file names: `DATA_WAITING_SUBDIR`, `DATA_COMPLETED_SUBDIR`, `INGEST_FILES_SUBDIR`, `MERGE_REPORTS_SUBDIR`, `LOGS_SUBDIR_NAME`, `RUN_LOG_FILENAME`, `LAST_PROBLEMS_FILENAME`, `LAST_CORRECTIONS_FILENAME`.
 
 **Note on `PUBLISHER_BY_DATE`.** The list is searched in order. The publisher for a date is the last entry whose effective date is on or before it. Where two publishers' ranges share a year (1903), the later publisher is treated as starting on 1 January of that year. This is an assumption and is marked in the source.
 
@@ -87,6 +87,7 @@ Compiled regular expressions. Each has a comment explaining the groups.
 - `PROBLEM_YEAR_PATTERN`: finds a plausible YYYYMMDD date inside a problem message. Month 01 to 12 and day 01 to 31 are enforced, so a date like `19110231` matches but `19111331` does not.
 - `PROBLEM_CATEGORY_PATTERN`: finds the leading `[category]` tag.
 - `INVALID_DATE_VALUE_PATTERN`: pulls the bad date out of an `invalid_date` message for the email.
+- `SOURCE_LABEL_IN_PROBLEM_PATTERN`: matches the "has been found in N tifflist file(s) yet" phrase in a `missing tiffs` message, for `normalize_problem_for_compare`.
 - `YEAR_COUNT_FILENAME_PATTERN`: matches the count file name in a year folder, such as `48issues432pages481lines.txt`.
 - `UNRECOGNIZED_ITEM_PATTERN`: pulls the skipped name out of an `unrecognized_filename` message, so the email can group names by file type.
 - `PROBLEM_SOURCE_FILE_PATTERN`: pulls the source file tag (`[1924tifflist.txt]`) that precedes the category tag, when there is one.
@@ -181,6 +182,7 @@ Problem strings are the link between the pipeline and its reports. Each starts w
 - `PROBLEM_CATEGORIES_NEVER_BLOCK` (`missing_tiffs`, `unrecognized_filename`): these never hold a year back. A Town List waiting for its TIFFs is a normal state, not an error.
 - `extract_year_from_problem(text)`: the year from the first plausible date in a message, or `None`.
 - `problem_category(text)`: the leading tag, or `"other"`.
+- `normalize_problem_for_compare(text)`: the form of a message used to tell whether it is the same problem as last run's. It removes the "found in N tifflist file(s)" part of `missing tiffs` messages (`SOURCE_LABEL_IN_PROBLEM_PATTERN`), which changes whenever a tifflist moves out of `DataWaiting/`. Both this run's and last run's problems go through it before they are compared.
 - `group_problems(problems)`: returns `(by_year_category, invalid_dates_by_year, aggregate_by_category, verbatim_counts)`.
 - `format_date_list(dates, limit)`: `'19110231', '19110230'` for a few dates, or the first few plus `and N more`.
 - `format_year_problem_line(year, category_counts, invalid_dates)`: one year's line, such as `  1911: 2 invalid date ('19110231', '19110230'); 1 missing town list`.
@@ -222,7 +224,9 @@ Problem categories the code emits:
 
 - `logs_dir_path(root)`: returns `root/_Logs`, creating it if needed.
 - `append_run_log(root, message)`: one timestamped line appended to `run_log.txt`.
-- `read_last_problems(root)` / `write_last_problems(root, problems)`: the sorted set of problem strings saved at the end of the previous run. `write_last_problems` is called on every run.
+- `read_last_problems(root)` / `write_last_problems(root, problems)`: the set of problem strings saved at the end of the previous run, in normalized form (see `normalize_problem_for_compare`). `write_last_problems` is called on every run.
+- `read_last_corrections(root)` / `write_last_corrections(root, corrections)`: the auto-correction notes the previous run reported. `read_last_corrections` returns `None`, not an empty set, when the file does not exist, so the caller can tell "no corrections last time" from "a folder last run by an older version".
+- `last_problems_file_exists(root)`: whether a previous run has saved its problem set at all.
 
 ### `folders.py`
 
@@ -247,9 +251,9 @@ Problem categories the code emits:
        - otherwise: *new*, queued for writing
   3. **Writing.** New records are chunked. The first chunk appends to the active (last) file if there is room. Remaining chunks go into new `_partN` files. IDs continue from the highest existing ID.
   4. **`.xlsx`.** Each written file gets a fresh `.xlsx`.
-  5. **Report.** Written only when the run added issues, found differing duplicates, changed the problem set, or had corrections.
+  5. **Report.** Written only when the run added issues, found differing duplicates, changed the problem set, or made a correction not reported before. "Changed" is judged on normalized problem text, and a correction is "new" if its note is not in `_Logs/last_corrections.txt`. A folder with a saved problem list but no saved corrections (last run by an older version) treats its current corrections as already reported.
   6. **Problem set.** Saved every run.
-  7. **Email.** Sent when the problem set changed or there were corrections.
+  7. **Email.** Sent when the problem set changed or there is a new correction. Only the new corrections are listed in it.
   8. **Run log and console summary.**
 
   Returns the set of held-back years. The caller uses it to keep their source files in `DataWaiting/`.
@@ -269,7 +273,7 @@ Imports `main` from `newspaper_ingest.cli` and calls it under `if __name__ == "_
 ## Rules for changing the code
 
 1. **Keep the column order.** `COLUMNS` must match the repository's expected order exactly.
-2. **Keep problem text stable.** The alert email and the resolved-problems count compare problem strings from one run to the next. Changing the wording of a message makes every existing problem look resolved and new on the next run. If you must change wording, expect one alert email.
+2. **Keep problem text stable.** The alert email and the resolved-problems count compare problem strings from one run to the next. Changing the wording of a message makes every existing problem look resolved and new on the next run. If you must change wording, expect one alert email. Anything in a message that can change without the problem changing (a count of files searched, a timestamp) must be stripped in `normalize_problem_for_compare`, or it will cause repeat emails. The `missing tiffs` message's "found in N tifflist file(s)" is the existing example.
 3. **Keep the `[category]` tag first** in every problem message. The grouping depends on it.
 4. **Keep the hold-back categories in sync.** A new category that should not hold back a year must be added to `PROBLEM_CATEGORIES_NEVER_BLOCK`. A new category that should hold back a year needs an 8-digit date in its message if it is to be attached to a year.
 5. **Do not overwrite existing issues.** Differing duplicates are reported, never replaced. This is the rule that protects earlier data.
